@@ -1,0 +1,10 @@
+flask
+flask-cors
+python-dotenv
+edge-tts
+moviepy
+imageio[ffmpeg]
+anthropic
+google-generativeai
+pillow
+requests
