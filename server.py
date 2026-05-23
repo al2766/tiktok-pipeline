@@ -30,7 +30,9 @@ jobs: dict = {}   # job_id → { status, video_b64, caption, error }
 
 TIKTOK_CLIENT_KEY    = os.environ.get("TIKTOK_CLIENT_KEY", "")
 TIKTOK_CLIENT_SECRET = os.environ.get("TIKTOK_CLIENT_SECRET", "")
-RENDER_URL           = "https://tiktok-pipeline-cgtt.onrender.com"
+RENDER_URL           = os.environ.get("RENDER_URL", "https://tiktok-pipeline-cgtt.onrender.com")
+# sandbox uses video.upload (draft), production uses video.publish (direct post)
+TIKTOK_SCOPE         = os.environ.get("TIKTOK_SCOPE", "video.upload,user.info.basic")
 TOKEN_FILE           = "/tmp/tiktok_tokens.json"
 
 
@@ -110,7 +112,7 @@ def oauth_start():
     params = {
         "client_key": TIKTOK_CLIENT_KEY,
         "response_type": "code",
-        "scope": "video.publish,user.info.basic",
+        "scope": TIKTOK_SCOPE,
         "redirect_uri": f"{RENDER_URL}/oauth/callback",
         "state": "provenweird",
     }
