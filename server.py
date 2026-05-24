@@ -1,8 +1,8 @@
 """
 Flask API wrapper around the TikTok video pipeline.
-POST /generate         { "topic": "..." }               → { "job_id": "..." }
-GET  /status/:id                                        → { "status": "...", "video_b64": "...", "caption": "..." }
-POST /post             { "job_id": "...", "title": "..." } → { "ok": true, "publish_id": "..." }
+POST /generate          { "topic": "..." }               → { "job_id": "..." }
+GET  /status/:id                                         → { "status": "...", "video_b64": "...", "caption": "..." }
+POST /post              { "job_id": "...", "title": "..." } → { "ok": true, "publish_id": "..." }
 GET  /oauth/start                                       → redirect to TikTok OAuth
 GET  /oauth/callback                                    → exchange code, store tokens
 GET  /oauth/status                                      → { "authorized": true/false }
