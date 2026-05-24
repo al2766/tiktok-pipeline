@@ -226,6 +226,15 @@ def health():
     return jsonify({"ok": True})
 
 
+@app.route("/debug/config")
+def debug_config():
+    return jsonify({
+        "client_key_prefix": TIKTOK_CLIENT_KEY[:8] if TIKTOK_CLIENT_KEY else "NOT_SET",
+        "scope": TIKTOK_SCOPE,
+        "render_url": RENDER_URL,
+    })
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     app.run(host="0.0.0.0", port=port)
