@@ -4,17 +4,19 @@ Input:  topic string  e.g. "honey never expires"
 Output: MP4 file in ./output/
 """
 
-import os, json, asyncio, textwrap, math, requests, io
+import os, json, asyncio, textwrap, math, requests, io, subprocess, re, gc
 from pathlib import Path
 from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
+import imageio
+import imageio_ffmpeg
 
 load_dotenv()
 
-# Use bundled ffmpeg binary (no system ffmpeg needed)
-import imageio_ffmpeg
 os.environ["FFMPEG_BINARY"] = imageio_ffmpeg.get_ffmpeg_exe()
+FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
+
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 GEMINI_API_KEY    = os.environ["GEMINI_API_KEY"]
 
@@ -22,7 +24,30 @@ OUTPUT_DIR = Path(__file__).parent / "output"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 VIDEO_W, VIDEO_H = 1080, 1920   # 9:16 portrait
-FPS = 30
+FPS = 24  # dropped from 30 — fewer frames, less memory pressure
+
+
+# ─── Font loading ─────────────────────────────────────────────────────────────
+
+def get_font(size: int) -> ImageFont.FreeTypeFont:
+    candidates = [
+        # Linux (Render)
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/ubuntu/Ubuntu-B.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+        # macOS
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/System/Library/Fonts/Arial.ttf",
+        "/Library/Fonts/Arial.ttf",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return ImageFont.truetype(path, size)
+    return ImageFont.load_default()
+
 
 # ─── Step 1: Script ──────────────────────────────────────────────────────────
 
@@ -85,13 +110,11 @@ def generate_image(visual_prompt: str, slug: str) -> Path:
     resp.raise_for_status()
     data = resp.json()
 
-    # Extract base64 image from response
     for part in data["candidates"][0]["content"]["parts"]:
         if part.get("inlineData"):
             import base64
             img_bytes = base64.b64decode(part["inlineData"]["data"])
             img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-            # Resize/crop to 9:16
             img = crop_to_ratio(img, VIDEO_W, VIDEO_H)
             path = OUTPUT_DIR / f"{slug}_bg.jpg"
             img.save(path, quality=95)
@@ -129,129 +152,135 @@ def generate_tts(script: str, slug: str) -> Path:
     return path
 
 
-# ─── Step 4: Video assembly ───────────────────────────────────────────────────
+# ─── Step 4: Video assembly (imageio + FFmpeg — no moviepy) ──────────────────
 
-def build_caption_frames(script: str, total_frames: int) -> list[str]:
-    words = script.split()
-    chunk_size = 5
-    chunks = [" ".join(words[i:i+chunk_size]) for i in range(0, len(words), chunk_size)]
-    frames_per_chunk = total_frames / len(chunks)
-    frame_captions = []
-    for i in range(total_frames):
-        idx = min(int(i / frames_per_chunk), len(chunks) - 1)
-        frame_captions.append(chunks[idx])
-    return frame_captions
+def _get_audio_duration(audio_path: Path) -> float:
+    result = subprocess.run(
+        [FFMPEG_EXE, "-i", str(audio_path)],
+        capture_output=True, text=True,
+    )
+    match = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", result.stderr)
+    if not match:
+        raise RuntimeError("Could not determine audio duration")
+    h, m, s = match.groups()
+    return int(h) * 3600 + int(m) * 60 + float(s)
 
 
-def draw_text_on_frame(
-    base_img: np.ndarray,
-    text: str,
-    hook: str = "",
-    show_hook: bool = False,
-) -> np.ndarray:
-    img = Image.fromarray(base_img)
-    draw = ImageDraw.Draw(img)
-
-    # Try system fonts
-    def get_font(size):
-        for name in [
-            "/System/Library/Fonts/Helvetica.ttc",
-            "/System/Library/Fonts/Arial.ttf",
-            "/Library/Fonts/Arial.ttf",
-        ]:
-            if os.path.exists(name):
-                return ImageFont.truetype(name, size)
-        return ImageFont.load_default()
-
-    # Dark gradient overlay at bottom for readability
-    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    ov_draw = ImageDraw.Draw(overlay)
+def _bake_gradient(img: np.ndarray) -> np.ndarray:
+    """Apply bottom gradient overlay once — avoids per-frame RGBA compositing."""
+    pil = Image.fromarray(img).convert("RGBA")
+    overlay = Image.new("RGBA", pil.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
     grad_top = VIDEO_H - 500
     for y in range(grad_top, VIDEO_H):
         alpha = int(180 * (y - grad_top) / (VIDEO_H - grad_top))
-        ov_draw.line([(0, y), (VIDEO_W, y)], fill=(0, 0, 0, alpha))
-    img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
-    draw = ImageDraw.Draw(img)
-
-    # Caption text at bottom
-    font_cap = get_font(62)
-    wrapped = textwrap.fill(text, width=22)
-    lines = wrapped.split("\n")
-    line_h = 75
-    total_h = len(lines) * line_h
-    y_start = VIDEO_H - total_h - 90
-
-    for line in lines:
-        bbox = draw.textbbox((0, 0), line, font=font_cap)
-        tw = bbox[2] - bbox[0]
-        x = (VIDEO_W - tw) // 2
-        # Black outline
-        for dx, dy in [(-3,0),(3,0),(0,-3),(0,3),(-2,-2),(2,-2),(-2,2),(2,2)]:
-            draw.text((x+dx, y_start+dy), line, font=font_cap, fill=(0, 0, 0))
-        draw.text((x, y_start), line, font=font_cap, fill=(255, 255, 255))
-        y_start += line_h
-
-    # Hook text at top (first 3 seconds)
-    if show_hook and hook:
-        font_hook = get_font(52)
-        wrapped_hook = textwrap.fill(hook, width=24)
-        hlines = wrapped_hook.split("\n")
-        y_h = 180
-        for hl in hlines:
-            bbox = draw.textbbox((0, 0), hl, font=font_hook)
-            tw = bbox[2] - bbox[0]
-            x = (VIDEO_W - tw) // 2
-            for dx, dy in [(-2,0),(2,0),(0,-2),(0,2)]:
-                draw.text((x+dx, y_h+dy), hl, font=font_hook, fill=(0, 0, 0))
-            draw.text((x, y_h), hl, font=font_hook, fill=(255, 230, 50))
-            y_h += 65
-
-    return np.array(img)
+        draw.line([(0, y), (VIDEO_W, y)], fill=(0, 0, 0, alpha))
+    result = Image.alpha_composite(pil, overlay).convert("RGB")
+    return np.array(result)
 
 
 def assemble_video(image_path: Path, audio_path: Path, script_data: dict, slug: str) -> Path:
     print("[4/4] Assembling video...")
-    from moviepy import VideoClip, AudioFileClip, ImageClip
 
-    audio = AudioFileClip(str(audio_path))
-    duration = audio.duration
+    duration = _get_audio_duration(audio_path)
     total_frames = int(duration * FPS)
 
-    base = np.array(Image.open(image_path).convert("RGB"))
-    captions = build_caption_frames(script_data["script"], total_frames)
+    # Pre-bake gradient into base image once (eliminates per-frame RGBA overhead)
+    raw_base = np.array(Image.open(image_path).convert("RGB"))
+    base = _bake_gradient(raw_base)
+    del raw_base
+    gc.collect()
+
+    # Pre-load fonts once
+    font_cap  = get_font(62)
+    font_hook = get_font(52)
+
+    # Build caption list once
+    words = script_data["script"].split()
+    chunk_size = 5
+    chunks = [" ".join(words[i:i+chunk_size]) for i in range(0, len(words), chunk_size)]
+    frames_per_chunk = total_frames / len(chunks)
     hook = script_data.get("hook", "")
 
-    # Ken Burns: gentle zoom from 1.0 → 1.08
-    def make_frame(t):
-        frame_idx = min(int(t * FPS), total_frames - 1)
+    def make_frame(frame_idx: int) -> np.ndarray:
+        t = frame_idx / FPS
         progress = t / duration
         zoom = 1.0 + 0.08 * progress
 
-        # Crop centre based on zoom
+        # Ken Burns crop
         h, w = base.shape[:2]
         new_w = int(w / zoom)
         new_h = int(h / zoom)
         x1 = (w - new_w) // 2
         y1 = (h - new_h) // 2
         cropped = base[y1:y1+new_h, x1:x1+new_w]
-        zoomed = np.array(Image.fromarray(cropped).resize((w, h), Image.LANCZOS))
+        zoomed = np.array(Image.fromarray(cropped).resize((w, h), Image.BILINEAR))
 
-        caption = captions[frame_idx]
-        show_hook = t < 3.0
-        return draw_text_on_frame(zoomed, caption, hook, show_hook)
+        # Draw text directly (gradient already baked — no RGBA needed)
+        img = Image.fromarray(zoomed)
+        draw = ImageDraw.Draw(img)
 
-    video = VideoClip(make_frame, duration=duration).with_fps(FPS)
-    video = video.with_audio(audio)
+        chunk_idx = min(int(frame_idx / frames_per_chunk), len(chunks) - 1)
+        caption = chunks[chunk_idx]
+        wrapped = textwrap.fill(caption, width=22)
+        lines = wrapped.split("\n")
+        line_h = 75
+        y_start = VIDEO_H - len(lines) * line_h - 90
 
-    out_path = OUTPUT_DIR / f"{slug}.mp4"
-    video.write_videofile(
-        str(out_path),
+        for line in lines:
+            bbox = draw.textbbox((0, 0), line, font=font_cap)
+            tw = bbox[2] - bbox[0]
+            x = (VIDEO_W - tw) // 2
+            for dx, dy in [(-3,0),(3,0),(0,-3),(0,3),(-2,-2),(2,-2),(-2,2),(2,2)]:
+                draw.text((x+dx, y_start+dy), line, font=font_cap, fill=(0, 0, 0))
+            draw.text((x, y_start), line, font=font_cap, fill=(255, 255, 255))
+            y_start += line_h
+
+        if t < 3.0 and hook:
+            wrapped_hook = textwrap.fill(hook, width=24)
+            y_h = 180
+            for hl in wrapped_hook.split("\n"):
+                bbox = draw.textbbox((0, 0), hl, font=font_hook)
+                tw = bbox[2] - bbox[0]
+                x = (VIDEO_W - tw) // 2
+                for dx, dy in [(-2,0),(2,0),(0,-2),(0,2)]:
+                    draw.text((x+dx, y_h+dy), hl, font=font_hook, fill=(0, 0, 0))
+                draw.text((x, y_h), hl, font=font_hook, fill=(255, 230, 50))
+                y_h += 65
+
+        return np.array(img)
+
+    # Write video frames via imageio (streams directly to FFmpeg — no moviepy needed)
+    silent_path = OUTPUT_DIR / f"{slug}_silent.mp4"
+    out_path    = OUTPUT_DIR / f"{slug}.mp4"
+
+    writer = imageio.get_writer(
+        str(silent_path),
         fps=FPS,
         codec="libx264",
-        audio_codec="aac",
-        logger=None,
+        quality=None,
+        ffmpeg_params=["-preset", "ultrafast", "-crf", "23", "-pix_fmt", "yuv420p"],
     )
-    audio.close()
+    try:
+        for i in range(total_frames):
+            writer.append_data(make_frame(i))
+    finally:
+        writer.close()
+
+    # Mux audio in a second pass (copy video stream — no re-encode)
+    subprocess.run(
+        [
+            FFMPEG_EXE, "-y",
+            "-i", str(silent_path),
+            "-i", str(audio_path),
+            "-c:v", "copy", "-c:a", "aac", "-shortest",
+            str(out_path),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    silent_path.unlink(missing_ok=True)
+
     print(f"\n✅ Video saved: {out_path}")
     return out_path
 
@@ -259,7 +288,7 @@ def assemble_video(image_path: Path, audio_path: Path, script_data: dict, slug: 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def generate_video(topic: str) -> Path:
-    import re, time
+    import time
     slug = re.sub(r"[^a-z0-9]+", "_", topic.lower())[:40] + f"_{int(time.time())}"
 
     script_data = generate_script(topic)
