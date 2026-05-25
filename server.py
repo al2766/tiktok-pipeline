@@ -275,14 +275,121 @@ def analyze_status(job_id: str):
 
 # ─── topic suggestions ────────────────────────────────────────────────────────
 
-# Channels to visit via Playwright — 3 per call, positions 30/31/32 = 9 topics
+# Instagram channels — Playwright visits these, fetches positions 9/10/11
+# (Instagram shows ~12 without auth so 9-11 are reliably reachable)
 INSPIRATION_ACCOUNTS = [
-    "https://www.tiktok.com/@scitrendz",
-    "https://www.tiktok.com/@factsverse",
-    "https://www.tiktok.com/@mindfacts",
+    "https://www.instagram.com/explainingtheocean/reels/",
+    "https://www.instagram.com/succezzcity/reels/",
+    "https://www.instagram.com/geopandamaps/reels/",
 ]
+VIDEO_POSITIONS = [9, 10, 11]
 
-VIDEO_POSITIONS = [30, 31, 32]  # skip newest 29, use videos at these positions
+# Reddit book research — User-Agent required or Reddit blocks the request
+_REDDIT_UA = "Mozilla/5.0 (compatible; provenweird-bot/1.0 +https://provenweird.com)"
+
+
+def _reddit_get_trending_books() -> list[str]:
+    """
+    Queries r/Fantasy top posts (last month) and asks Claude to extract
+    the most-discussed book/series names. Falls back to a curated seed list.
+    """
+    try:
+        r = http_requests.get(
+            "https://www.reddit.com/r/Fantasy/top.json",
+            params={"t": "month", "limit": 25},
+            headers={"User-Agent": _REDDIT_UA},
+            timeout=8,
+        )
+        posts = r.json()["data"]["children"]
+        titles = [p["data"]["title"] for p in posts[:20]]
+        title_block = "\n".join(titles)
+
+        resp = http_requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": os.environ["ANTHROPIC_API_KEY"],
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 150,
+                "messages": [{"role": "user", "content": (
+                    "From these Reddit r/Fantasy post titles, extract the names of the "
+                    "3 most-discussed specific books or series. Return a JSON array of strings only.\n\n"
+                    + title_block
+                )}],
+            },
+            timeout=10,
+        )
+        raw = resp.json()["content"][0]["text"].strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1].lstrip("json").strip().rsplit("```", 1)[0].strip()
+        return json.loads(raw)
+    except Exception as e:
+        print(f"Reddit book fetch failed: {e}")
+        return ["ACOTAR", "Fourth Wing", "The Name of the Wind"]
+
+
+def _reddit_get_book_moments(book: str) -> list[str]:
+    """
+    Searches Reddit for memorable/emotional scenes from a book.
+    Uses multiple search terms to catch threads that phrase it differently.
+    Returns up to 4 post titles/excerpts.
+    """
+    results = []
+    search_terms = [
+        f"{book} scene emotional",
+        f"{book} that moment chapter",
+        f"{book} plot twist reaction",
+        f'"{book}" favorite scene',
+    ]
+    tried = set()
+    for terms in search_terms:
+        if len(results) >= 4:
+            break
+        if terms in tried:
+            continue
+        tried.add(terms)
+        try:
+            r = http_requests.get(
+                "https://www.reddit.com/search.json",
+                params={"q": terms, "sort": "top", "t": "year", "limit": 5},
+                headers={"User-Agent": _REDDIT_UA},
+                timeout=8,
+            )
+            for p in r.json()["data"]["children"]:
+                d = p["data"]
+                snippet = (d.get("selftext") or "")[:150].strip()
+                entry = d["title"] + (f" — {snippet}" if snippet else "")
+                results.append(entry[:250])
+                if len(results) >= 4:
+                    break
+        except Exception:
+            pass
+    return results
+
+
+def _reddit_get_psychology_topics() -> list[str]:
+    """
+    Gets top posts from r/psychology and r/selfimprovement this month.
+    Returns titles of the most upvoted discussions — raw material for
+    psychology hack hooks.
+    """
+    results = []
+    for sub in ["psychology", "selfimprovement"]:
+        try:
+            r = http_requests.get(
+                f"https://www.reddit.com/r/{sub}/top.json",
+                params={"t": "month", "limit": 10},
+                headers={"User-Agent": _REDDIT_UA},
+                timeout=8,
+            )
+            for p in r.json()["data"]["children"]:
+                results.append(p["data"]["title"][:200])
+        except Exception:
+            pass
+    return results[:12]
 
 
 def _playwright_get_channel_videos(channel_url: str, positions: list) -> list:
@@ -293,7 +400,7 @@ def _playwright_get_channel_videos(channel_url: str, positions: list) -> list:
     """
     from playwright.sync_api import sync_playwright
 
-    handle = channel_url.rstrip("/").split("@")[-1]
+    handle = channel_url.rstrip("/").split("@")[-1].split("/")[0]
     results = []
 
     try:
@@ -303,66 +410,75 @@ def _playwright_get_channel_videos(channel_url: str, positions: list) -> list:
                 args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
             )
             ctx = browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-                    "AppleWebKit/605.1.15 (KHTML, like Gecko) "
-                    "Version/17.0 Mobile/15E148 Safari/604.1"
-                ),
-                viewport={"width": 390, "height": 844},
+                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                viewport={"width": 1280, "height": 900},
                 locale="en-US",
             )
             page = ctx.new_page()
-            page.goto(channel_url, wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_timeout(3000)
+            page.goto(channel_url, wait_until="networkidle", timeout=30000)
+            page.wait_for_timeout(4000)
 
-            # Scroll until we have at least max(positions)+3 video links loaded
+            # Dismiss Instagram login popup
+            for sel in ['[aria-label="Close"]', 'button:has-text("Not now")', 'button:has-text("Not Now")']:
+                try:
+                    page.locator(sel).first.click(timeout=2000)
+                    page.wait_for_timeout(1000)
+                except Exception:
+                    pass
+
+            # Scroll to trigger lazy load
             target = max(positions) + 3
-            for _ in range(30):
-                links = page.locator('a[href*="/video/"]').all()
-                if len(links) >= target:
+            for _ in range(8):
+                links = page.locator('a[href*="/reel/"], a[href*="/p/"]').all()
+                hrefs_raw = [l.get_attribute("href") for l in links]
+                hrefs_raw = [h for h in hrefs_raw if h and ("/reel/" in h or "/p/" in h)]
+                seen: set = set()
+                unique = [h for h in hrefs_raw if not (h in seen or seen.add(h))]  # type: ignore[func-returns-value]
+                if len(unique) >= target:
                     break
                 page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                page.wait_for_timeout(1800)
+                page.wait_for_timeout(1500)
 
-            links = page.locator('a[href*="/video/"]').all()
-            print(f"[{handle}] {len(links)} video links loaded")
+            print(f"[{handle}] {len(unique)} reel links loaded")
 
             for pos in positions:
                 idx = pos - 1
-                if idx >= len(links):
-                    print(f"[{handle}] only {len(links)} links, can't reach #{pos}")
+                if idx >= len(unique):
+                    print(f"[{handle}] only {len(unique)} links, can't reach #{pos}")
                     continue
 
-                href = links[idx].get_attribute("href") or ""
-                if not href:
-                    continue
+                href = unique[idx]
                 if href.startswith("/"):
-                    href = f"https://www.tiktok.com{href}"
+                    href = f"https://www.instagram.com{href}"
 
-                # Visit the video page to extract its description / caption text
                 vp = ctx.new_page()
                 try:
-                    vp.goto(href, wait_until="domcontentloaded", timeout=20000)
-                    vp.wait_for_timeout(2500)
-
-                    text = ""
-                    for sel in [
-                        '[data-e2e="video-desc"]',
-                        '[data-e2e="browse-video-desc"]',
-                        'h1[data-e2e]',
-                        'span[class*="SpanText"]',
-                        "h1",
-                    ]:
+                    vp.goto(href, wait_until="networkidle", timeout=20000)
+                    vp.wait_for_timeout(3000)
+                    for sel in ['[aria-label="Close"]', 'button:has-text("Not now")']:
                         try:
-                            t = vp.locator(sel).first.inner_text(timeout=2000).strip()
-                            if t and len(t) > 5:
-                                text = t[:500]
-                                break
+                            vp.locator(sel).first.click(timeout=1500)
                         except Exception:
                             pass
 
+                    text = ""
+                    # og:description is most reliable on Instagram
+                    try:
+                        text = vp.get_attribute('meta[property="og:description"]', "content", timeout=3000) or ""
+                    except Exception:
+                        pass
+                    if not text:
+                        for sel in ["h1", '[class*="_a9zs"]', 'span[class*="caption"]']:
+                            try:
+                                t = vp.locator(sel).first.inner_text(timeout=2000).strip()
+                                if t and len(t) > 5:
+                                    text = t
+                                    break
+                            except Exception:
+                                pass
+                    text = text[:400]
                     results.append({"channel": handle, "position": pos, "url": href, "text": text})
-                    print(f"[{handle}] #{pos}: {text[:80]}")
+                    print(f"[{handle}] #{pos}: {text[:100]}")
                 except Exception as e:
                     results.append({"channel": handle, "position": pos, "url": href, "text": "", "error": str(e)})
                 finally:
@@ -376,50 +492,7 @@ def _playwright_get_channel_videos(channel_url: str, positions: list) -> list:
     return results
 
 
-@app.route("/suggest-topics", methods=["GET"])
-def suggest_topics():
-    """
-    Uses Playwright to visit each inspiration channel, fetches the video at
-    positions 30, 31, 32 (3 channels × 3 positions = 9 videos). Returns 9
-    topic ideas — one per video — so the user can verify by counting down
-    to those exact positions on each channel.
-    """
-    all_videos = []
-    for account_url in INSPIRATION_ACCOUNTS:
-        videos = _playwright_get_channel_videos(account_url, VIDEO_POSITIONS)
-        all_videos.extend(videos)
-
-    if not all_videos:
-        # Playwright unavailable or all channels blocked — Claude fallback
-        import time as _t
-        prompt = f"""You are a TikTok science content strategist for @provenweird.
-
-Generate 9 ORIGINAL topic ideas for 60-second science/facts videos. Cover biology, physics, psychology, space, ocean, human body, animals, historical paradoxes. Each topic must have a built-in paradox, counterintuitive angle, or philosophical hook. No "Did you know". Vary the formula. Each phrase 10-20 words max.
-
-Seed: {int(_t.time())}
-
-Return ONLY a JSON array of 9 strings. No markdown."""
-        source = "claude_fallback"
-    else:
-        lines = [
-            f"@{v['channel']} video #{v['position']}: {v['text'] or '(no caption extracted)'}"
-            for v in all_videos
-        ]
-        sample = "\n".join(lines)
-        prompt = f"""You are a TikTok science content strategist for @provenweird.
-
-Below are the actual captions/descriptions of {len(all_videos)} videos at positions 30–32 on 3 successful science facts channels. These are proven topics from ~3–6 months ago.
-
-For EACH video listed, generate ONE inspired but wholly original topic idea that captures the same energy and angle but uses a completely different fact. Output exactly {len(all_videos)} topics in the same order so they can be mapped back to each video.
-
-Videos:
-{sample}
-
-Rules: no "Did you know", each topic 10-20 words max, dry sardonic tone, vary the formula.
-
-Return ONLY a JSON array of {len(all_videos)} strings. No markdown. No explanation."""
-        source = "playwright"
-
+def _call_claude(prompt: str, max_tokens: int = 800) -> str:
     resp = http_requests.post(
         "https://api.anthropic.com/v1/messages",
         headers={
@@ -429,7 +502,7 @@ Return ONLY a JSON array of {len(all_videos)} strings. No markdown. No explanati
         },
         json={
             "model": "claude-haiku-4-5-20251001",
-            "max_tokens": 600,
+            "max_tokens": max_tokens,
             "messages": [{"role": "user", "content": prompt}],
         },
         timeout=30,
@@ -439,13 +512,164 @@ Return ONLY a JSON array of {len(all_videos)} strings. No markdown. No explanati
     if raw.startswith("```"):
         raw = raw.split("```")[1].lstrip("json").strip()
         raw = raw.rsplit("```", 1)[0].strip()
-    topics = json.loads(raw)
+    return raw
+
+
+@app.route("/suggest-topics", methods=["GET"])
+def suggest_topics():
+    """
+    Generates 9 topic ideas across 3 formats, each grounded in real research:
+
+    FORMAT 1 — Scenario Game (3 topics)
+    Real Instagram channel captions (positions 9-11) → viewer-inside-a-scenario hooks.
+    The fact plays out like a game. Viewer picks a side or imagines they're there.
+
+    FORMAT 2 — Book/Famous Moment Proxy (3 topics)
+    Reddit r/Fantasy trending books → memorable emotional scenes → map to real
+    psychology or biology fact → @provenweird explains the real science through
+    the book moment. Book readers self-select immediately.
+
+    FORMAT 3 — Psychology Hack (3 topics)
+    Reddit r/psychology + r/selfimprovement top posts → reframe as a usable
+    human behaviour insight. Dry, not preachy. Teaches through specificity.
+    """
+    import threading, time as _t
+
+    # ── Run all 3 research sources in parallel ─────────────────────────────────
+    insta_videos: list = []
+    book_data: dict = {"books": [], "moments": {}}
+    psych_titles: list = []
+
+    def fetch_instagram():
+        for url in INSPIRATION_ACCOUNTS:
+            insta_videos.extend(_playwright_get_channel_videos(url, VIDEO_POSITIONS))
+
+    def fetch_books():
+        books = _reddit_get_trending_books()
+        book_data["books"] = books
+        for book in books[:3]:
+            book_data["moments"][book] = _reddit_get_book_moments(book)
+
+    def fetch_psych():
+        psych_titles.extend(_reddit_get_psychology_topics())
+
+    threads = [
+        threading.Thread(target=fetch_instagram, daemon=True),
+        threading.Thread(target=fetch_books, daemon=True),
+        threading.Thread(target=fetch_psych, daemon=True),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+
+    seed = int(_t.time())
+
+    # ── Build the prompt with all 3 research inputs ────────────────────────────
+
+    # Format 1: scenario game — from Instagram channel data
+    if insta_videos:
+        insta_block = "\n".join(
+            f"@{v['channel']} #{v['position']}: {v.get('text','')[:200]}"
+            for v in insta_videos
+        )
+        f1_instruction = f"""FORMAT 1 — SCENARIO GAME (generate exactly 3 topics)
+Inspired by these real Instagram science/geography reels (positions 9-11):
+{insta_block}
+
+Each topic puts the viewer INSIDE a scenario before revealing the fact.
+Opens with: "What if you were..." / "If this happened right now..." / "You're in [place], and..."
+The science answers what happens next. Viewer is a character in the story.
+Do NOT end with a joke or punchline. The scenario IS the hook — the fact is the payoff."""
+    else:
+        f1_instruction = f"""FORMAT 1 — SCENARIO GAME (generate exactly 3 topics)
+Topics that put the viewer inside a physical or psychological scenario before revealing the fact.
+Opens with: "What if you were..." / "If this happened to you right now..."
+The science answers what happens. Viewer is a character. No punchline — the fact is the payoff.
+Seed: {seed}"""
+
+    # Format 2: book moment proxy — from Reddit book research
+    books = book_data.get("books", ["ACOTAR", "Fourth Wing", "The Name of the Wind"])
+    moments_lines = []
+    for book, moments in book_data.get("moments", {}).items():
+        for m in moments[:2]:
+            moments_lines.append(f"{book}: {m}")
+    if moments_lines:
+        moments_block = "\n".join(moments_lines[:6])
+        f2_instruction = f"""FORMAT 2 — BOOK MOMENT PROXY (generate exactly 3 topics)
+Trending books on Reddit r/Fantasy right now: {', '.join(books)}
+Memorable scenes/moments being discussed:
+{moments_block}
+
+Each topic names a specific book/scene in the first 5 words, then reveals the real science behind it.
+Example structure: "[Book] fans — that scene where [X happens] is a real [phenomenon]."
+Book readers self-select. Non-readers still learn the real fact. No spoiler framing needed — the science IS the reveal.
+Use different books across the 3 topics."""
+    else:
+        f2_instruction = f"""FORMAT 2 — BOOK MOMENT PROXY (generate exactly 3 topics)
+Pick 3 well-known fantasy/fiction books (ACOTAR, Fourth Wing, The Name of the Wind, or similar).
+Each topic: name the book + a specific type of scene (fear, heartbreak, adrenaline, grief), then
+reveal the real psychology/biology behind why that scene hits so hard.
+Book readers self-select from the first 5 words. No spoilers needed — the science is the reveal.
+Seed: {seed}"""
+
+    # Format 3: psychology hack — from Reddit psychology data
+    if psych_titles:
+        psych_block = "\n".join(psych_titles[:8])
+        f3_instruction = f"""FORMAT 3 — PSYCHOLOGY HACK (generate exactly 3 topics)
+Top discussions on r/psychology and r/selfimprovement right now:
+{psych_block}
+
+Each topic is a real human behaviour pattern framed as something specific and usable.
+NOT motivational. NOT advice. Just the fact stated in a way that makes the viewer feel smarter.
+Example: "The reason you work harder after almost winning isn't motivation — it's loss aversion."
+Dry, specific, no preachiness. The insight should feel like a cheat code, not a lecture."""
+    else:
+        f3_instruction = f"""FORMAT 3 — PSYCHOLOGY HACK (generate exactly 3 topics)
+Each topic is a real human behaviour or social psychology fact framed as a specific, usable insight.
+NOT motivational. NOT advice. Dry, factual, makes the viewer feel smarter.
+Example: "The reason you work harder after almost winning isn't motivation — it's loss aversion."
+Seed: {seed}"""
+
+    prompt = f"""You are writing topic hooks for @provenweird — a science/facts short video channel.
+Voice: dry, confident, never excited, never preachy, never trying to be funny for the sake of it.
+
+Generate exactly 9 topic hooks: 3 per format below. Each 10-20 words.
+
+CRITICAL RULES:
+- No "Did you know"
+- No punchlines that mock things people love (games, books, hobbies)
+- No passive voice in the hook
+- Each hook must make a viewer STOP because they're personally invested — not because it's clever
+- Dry tone = confident and specific, not deadpan comedy
+
+{f1_instruction}
+
+{f2_instruction}
+
+{f3_instruction}
+
+Return ONLY a JSON object with keys "scenario_game", "book_moment", "psychology_hack" — each a list of 3 strings.
+No markdown. No explanation."""
+
+    raw = _call_claude(prompt, max_tokens=900)
+    try:
+        data = json.loads(raw)
+        topics = (
+            data.get("scenario_game", []) +
+            data.get("book_moment", []) +
+            data.get("psychology_hack", [])
+        )
+    except Exception:
+        topics = []
 
     return jsonify({
         "topics": topics,
-        "source": source,
-        "source_count": len(all_videos),
-        "videos": all_videos,   # channel + position + url + text — for verification
+        "by_format": data if "data" in dir() else {},
+        "source": "playwright+reddit" if (insta_videos or moments_lines) else "claude_fallback",
+        "source_count": len(insta_videos),
+        "videos": insta_videos,
+        "books_researched": books,
     })
 
 
