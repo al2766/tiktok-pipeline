@@ -62,19 +62,25 @@ def _run_job(job_id: str, topic: str):
         jobs[job_id]["caption"] = script_data.get("tiktok_caption", "")
 
         jobs[job_id]["step"] = "images"
-        image_paths = generate_images(script_data["visual_prompts"], slug)
+        image_paths, img_cost = generate_images(script_data["visual_prompts"], slug)
 
         jobs[job_id]["step"] = "voice"
         audio_path, word_boundaries = generate_tts(script_data["script"], slug)
 
         jobs[job_id]["step"] = "animation"
-        clip_paths = animate_images(image_paths, slug)
+        clip_paths, clip_cost = animate_images(image_paths, slug)
 
         jobs[job_id]["step"] = "assembly"
         video_path = assemble_video(clip_paths, audio_path, word_boundaries, script_data, slug)
 
         # Store path only — never load video into RAM
         jobs[job_id]["video_path"] = str(video_path)
+
+        # Log cost summary
+        from pipeline import _get_audio_duration, print_cost_summary
+        audio_dur    = _get_audio_duration(audio_path)
+        cost_summary = print_cost_summary(img_cost, clip_cost, audio_dur, audio_dur)
+        jobs[job_id]["cost"] = cost_summary
 
         # Cleanup all intermediates immediately
         for p in image_paths:

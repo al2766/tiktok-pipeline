@@ -1,30 +1,40 @@
 """
-@provenweird TikTok Video Pipeline — v2
+@provenweird TikTok Video Pipeline — v3
 Input:  topic string
 Output: MP4 file in ./output/
 
 Pipeline:
-  1. Claude  → 10-sentence script + per-sentence visual prompts
+  1. Claude  → 12-sentence script + per-sentence visual prompts
   2. ElevenLabs → natural voice audio + word-level timestamps
-  3. FAL AI (FLUX) → 1 HD 9:16 image per sentence
-  4. Kling AI → animate each image into a 5s video clip
+  3. FAL AI (FLUX) → 12 HD 9:16 images, parallelised, cached
+  4. Animation → hybrid: Kling for hero scenes, FFmpeg zoompan for the rest
   5. FFmpeg  → concat clips + mux audio + burn animated captions
+
+Config env vars (all optional):
+  VIDEO_MODE          = hybrid | full_kling | no_kling  (default: hybrid)
+  HERO_SCENE_COUNT    = 3 or 4  (default: 4)
+  HERO_SCENE_INDICES  = "0,5,10,11"  (overrides auto-selection)
+  ENABLE_ASSET_CACHE  = true | false  (default: true)
+  ENABLE_KLING_RESUME = true | false  (default: true)
 """
 
-import os, json, re, time, subprocess, base64, gc, requests, textwrap, asyncio
+import os, json, re, time, subprocess, base64, gc, requests, textwrap, asyncio, hashlib, shutil
 import jwt
 from pathlib import Path
 from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFont
 import fal_client
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 load_dotenv()
 
-ANTHROPIC_API_KEY  = os.environ["ANTHROPIC_API_KEY"]
-ELEVENLABS_API_KEY = os.environ["ELEVENLABS_API_KEY"]
-KLING_ACCESS_KEY   = os.environ["KLING_ACCESS_KEY"]
-KLING_SECRET_KEY   = os.environ["KLING_SECRET_KEY"]
-FAL_KEY            = os.environ["FAL_KEY"]
+# ─── API Keys ─────────────────────────────────────────────────────────────────
+
+ANTHROPIC_API_KEY   = os.environ["ANTHROPIC_API_KEY"]
+ELEVENLABS_API_KEY  = os.environ["ELEVENLABS_API_KEY"]
+KLING_ACCESS_KEY    = os.environ["KLING_ACCESS_KEY"]
+KLING_SECRET_KEY    = os.environ["KLING_SECRET_KEY"]
+FAL_KEY             = os.environ["FAL_KEY"]
 os.environ["FAL_KEY"] = FAL_KEY
 
 import imageio_ffmpeg
@@ -33,8 +43,33 @@ FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 OUTPUT_DIR = Path(__file__).parent / "output"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-VIDEO_W, VIDEO_H = 1080, 1920
-ELEVENLABS_VOICE_ID = "nPczCjzI2devNBz1zQrb"  # Brian — deep, natural, male
+VIDEO_W, VIDEO_H       = 1080, 1920
+ELEVENLABS_VOICE_ID    = "nPczCjzI2devNBz1zQrb"  # Brian — deep, natural, male
+
+# ─── Pipeline Config ──────────────────────────────────────────────────────────
+
+VIDEO_MODE          = os.environ.get("VIDEO_MODE", "hybrid")           # hybrid | full_kling | no_kling
+HERO_SCENE_COUNT    = int(os.environ.get("HERO_SCENE_COUNT", "4"))     # 3 or 4
+_hero_env           = os.environ.get("HERO_SCENE_INDICES", "")
+HERO_SCENE_INDICES  = [int(x) for x in _hero_env.split(",") if x.strip()] if _hero_env else None
+ENABLE_ASSET_CACHE  = os.environ.get("ENABLE_ASSET_CACHE", "true").lower() == "true"
+ENABLE_KLING_RESUME = os.environ.get("ENABLE_KLING_RESUME", "true").lower() == "true"
+
+# ─── Asset Cache ──────────────────────────────────────────────────────────────
+# Ephemeral (/tmp) — survives within one Render instance lifetime, not across deploys.
+# Still valuable: retrying a crashed job reuses all completed assets.
+
+CACHE_DIR = Path("/tmp/provenweird_cache")
+for _sub in ["scripts", "images", "voice", "kling"]:
+    (CACHE_DIR / _sub).mkdir(parents=True, exist_ok=True)
+
+
+def _hash(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()[:16]
+
+
+def _hash_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()[:16]
 
 
 # ─── Fonts ────────────────────────────────────────────────────────────────────
@@ -55,6 +90,14 @@ def get_font(size: int) -> ImageFont.FreeTypeFont:
 
 def generate_script(topic: str) -> dict:
     print(f"[1/5] Generating script: {topic}")
+
+    if ENABLE_ASSET_CACHE:
+        cache_path = CACHE_DIR / "scripts" / f"{_hash(topic)}.json"
+        if cache_path.exists():
+            data = json.loads(cache_path.read_text())
+            print(f"   Script reused from cache.")
+            return data
+
     system = """You write scripts for @provenweird — a faceless science facts TikTok. Your scripts are engineered to keep 65%+ of viewers past the 3-second mark. The algorithm punishes weak hooks and rewards completion.
 
 VOICE: Tom Scott meets dry stand-up. Confident, slightly sardonic, conversational authority. NOT excited. NOT a textbook. Sound like a brilliant person who finds most explanations inadequate and is going to fix that — quickly.
@@ -64,23 +107,27 @@ CHOOSE THE BEST FORMULA for this topic and apply it:
 - Formula B (CURIOSITY GAP): Open the loop, don't answer it. Best when the MECHANISM is more interesting than the fact.
 - Formula C (MYTH-BUST): "You've been told X. That's wrong." Best when a popular belief is false.
 - Formula D (STAKES-FIRST): Open with the consequence affecting the viewer directly. Best for biology/psychology.
-- Formula E (EXISTENTIAL PIVOT): Lead with the philosophical QUESTION the fact raises — not the fact itself. The science is the evidence, not the hook. Best when the fact implies something about identity, consciousness, existence, or time. Example: instead of "your body replaces its cells every 7 years" → "If your body replaces most of its cells over time, are you still the same person?" The question opens a loop inside the viewer's own head. They save it because the question is the point.
+- Formula E (EXISTENTIAL PIVOT): Lead with the philosophical QUESTION the fact raises — not the fact itself. The science is the evidence, not the hook. Best when the fact implies something about identity, consciousness, existence, or time.
+- Formula F (SCENARIO GAME): Put the viewer INSIDE a hypothetical scenario. The fact answers what happens next. Opens with "What if you were..." The science is the answer to a question they're now personally invested in.
+- Formula G (SCALE REVEAL): Use a geographic or population-scale comparison to make an abstract fact viscerally real.
+- Formula H (FAMOUS PROXY): Use a celebrity, popular book/franchise, or already-loved concept as the vehicle. The viewer already has emotional connection to the subject.
 
 STRUCTURE (exactly 12 sentences — minimum 60 seconds for TikTok Creator Rewards):
-1.  HOOK — The scroll-stopper. State the paradox, gap, myth, or stakes. NEVER "Did you know". Max 15 words.
+1.  HOOK — The scroll-stopper. State the paradox, gap, myth, stakes, or scenario. NEVER "Did you know". Max 15 words.
 2-3. DESTABILISE — Confirm the hook is real. Add a layer that makes it even stranger.
-4.  SPECIFIC NUMBER — One exact measurement or statistic. This anchors credibility. (e.g. "exactly 37 degrees", "900 million tonnes", "3 times per second")
-5-9. MECHANISM — Explain WHY, fast. Max 12 words per sentence. Plain language, no passive voice. Each sentence lands alone.
-10. HUMAN COMPARISON — Scale it to something absurd and relatable. This is the shareable moment.
+4.  SPECIFIC NUMBER — One exact measurement or statistic. This anchors credibility.
+5-9. MECHANISM — Explain WHY, fast. Max 12 words per sentence. Plain language, no passive voice.
+10. HUMAN COMPARISON — Scale it to something absurd and relatable. The shareable moment.
 11. TWIST — The most unexpected implication. The thing they didn't see coming.
-12. KICKER — Dry callback to the hook. Reframes everything. This is the line people screenshot and comment.
+12. KICKER — Dry callback to the hook. Reframes everything. The line people screenshot.
 
 NON-NEGOTIABLE RULES:
-- NEVER open with "Did you know", "Today we're", "It has been", or any passive opener
-- NEVER end on a question to the viewer ("What do you think?")
-- Exactly one specific number/measurement — not zero, not two
-- Total script: 90-130 words (60-70 seconds of speech at natural pace)
+- NEVER "Did you know", "Today we're", passive openers
+- NEVER end on a question to the viewer
+- Exactly one specific number — not zero, not two
+- Total: 90-130 words (60-70 seconds at natural pace)
 - Second-person where possible ("your", "you", "imagine")
+- Dry = confident + specific. NOT dismissive. The hook must make people feel smart, not targeted.
 - Halal content only. No music references.
 
 Return ONLY valid JSON (no markdown, no backticks):
@@ -115,118 +162,126 @@ Return ONLY valid JSON (no markdown, no backticks):
                 raw = raw[4:]
         try:
             data = json.loads(raw.strip())
-            # Build full script string from sentences
             data["script"] = " ".join(data["sentences"])
             print(f"   Hook: {data['hook']}")
+            if ENABLE_ASSET_CACHE:
+                cache_path.write_text(json.dumps(data))
             return data
         except json.JSONDecodeError:
             time.sleep(2)
-    raise RuntimeError("Script generation failed")
+    raise RuntimeError("Script generation failed after 3 attempts")
 
 
-# ─── Step 2: TTS with word timestamps ────────────────────────────────────────
+# ─── Step 2: TTS with word timestamps ─────────────────────────────────────────
 
 def _whisper_word_boundaries(audio_path: Path) -> list[dict]:
-    """Run faster-whisper on audio to extract word-level timestamps."""
     from faster_whisper import WhisperModel
     model_dir = Path(__file__).parent / "whisper_models"
     model_dir.mkdir(exist_ok=True)
-    print("   Running Whisper for word timestamps...")
     model = WhisperModel("small", device="cpu", compute_type="int8",
                          download_root=str(model_dir))
     segments_raw, _ = model.transcribe(str(audio_path), word_timestamps=True, vad_filter=True)
     boundaries = []
     for seg in segments_raw:
-        if seg.words:
-            for w in seg.words:
-                boundaries.append({
-                    "word":  w.word.strip(),
-                    "start": round(w.start, 3),
-                    "end":   round(w.end, 3),
-                })
+        for w in seg.words:
+            boundaries.append({"word": w.word.strip(), "start": w.start, "end": w.end})
     del model
     return boundaries
 
 
 def _elevenlabs_tts(script: str, audio_path: Path) -> list[dict] | None:
-    """Try ElevenLabs TTS. Returns word boundaries on success, None on 401."""
     resp = requests.post(
         f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}/with-timestamps",
         headers={"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"},
         json={
             "text": script,
             "model_id": "eleven_multilingual_v2",
-            "voice_settings": {
-                "stability": 0.5,
-                "similarity_boost": 0.85,
-                "style": 0.2,
-                "use_speaker_boost": True,
-            },
+            "voice_settings": {"stability": 0.5, "similarity_boost": 0.85, "style": 0.2},
         },
         timeout=60,
     )
-    if resp.status_code == 401:
+    if resp.status_code != 200:
         return None
-    resp.raise_for_status()
     data = resp.json()
     audio_path.write_bytes(base64.b64decode(data["audio_base64"]))
-
-    boundaries, alignment = [], data.get("alignment", {})
-    chars  = alignment.get("characters", [])
-    starts = alignment.get("character_start_times_seconds", [])
-    ends   = alignment.get("character_end_times_seconds", [])
-
-    word, w_start, w_end = "", None, None
-    for ch, s, e in zip(chars, starts, ends):
-        if ch in (" ", "\n"):
-            if word:
-                boundaries.append({"word": word, "start": round(w_start, 3), "end": round(w_end, 3)})
-                word, w_start, w_end = "", None, None
-        else:
-            if w_start is None:
-                w_start = s
-            w_end = e
-            word += ch
-    if word:
-        boundaries.append({"word": word, "start": round(w_start, 3), "end": round(w_end, 3)})
+    chars = data.get("alignment", {})
+    if not chars:
+        return None
+    char_starts = chars.get("character_start_times_seconds", [])
+    char_ends   = chars.get("character_end_times_seconds", [])
+    char_list   = chars.get("characters", [])
+    boundaries = []
+    i, n = 0, len(char_list)
+    while i < n:
+        while i < n and char_list[i] == " ":
+            i += 1
+        if i >= n:
+            break
+        j = i
+        while j < n and char_list[j] != " ":
+            j += 1
+        word = "".join(char_list[i:j])
+        boundaries.append({"word": word, "start": char_starts[i], "end": char_ends[j - 1]})
+        i = j
+    print(f"   {len(boundaries)} word boundaries, audio saved.")
     return boundaries
 
 
 def _edge_tts_generate(script: str, audio_path: Path):
-    import edge_tts
     async def _run():
-        comm = edge_tts.Communicate(script, voice="en-US-ChristopherNeural")
-        await comm.save(str(audio_path))
+        import edge_tts
+        c = edge_tts.Communicate(script, "en-GB-RyanNeural")
+        await c.save(str(audio_path))
     asyncio.run(_run())
 
 
 def generate_tts(script: str, slug: str) -> tuple[Path, list[dict]]:
     audio_path = OUTPUT_DIR / f"{slug}_audio.mp3"
 
+    if ENABLE_ASSET_CACHE:
+        cache_key   = _hash(script)
+        audio_cache = CACHE_DIR / "voice" / f"{cache_key}.mp3"
+        bound_cache = CACHE_DIR / "voice" / f"{cache_key}.json"
+        if audio_cache.exists() and bound_cache.exists():
+            shutil.copy2(audio_cache, audio_path)
+            boundaries = json.loads(bound_cache.read_text())
+            print(f"[2/5] Voice reused from cache ({len(boundaries)} boundaries).")
+            return audio_path, boundaries
+
     print("[2/5] Generating voice with ElevenLabs...")
     boundaries = _elevenlabs_tts(script, audio_path)
-
     if boundaries is None:
-        # ElevenLabs blocked (free tier / VPN detection) — fall back to edge-tts
         print("   ElevenLabs unavailable — falling back to edge-tts + Whisper timestamps")
         _edge_tts_generate(script, audio_path)
         boundaries = _whisper_word_boundaries(audio_path)
 
-    print(f"   {len(boundaries)} word boundaries, audio saved.")
+    if ENABLE_ASSET_CACHE:
+        shutil.copy2(audio_path, audio_cache)
+        bound_cache.write_text(json.dumps(boundaries))
+
     return audio_path, boundaries
 
 
-# ─── Step 3: FAL AI images (one per sentence) ─────────────────────────────────
+# ─── Step 3: FAL AI images — parallelised + cached ────────────────────────────
 
-def generate_images(visual_prompts: list[str], slug: str) -> list[Path]:
-    """Generate images via FAL FLUX and save locally. Returns list of local paths."""
-    print(f"[3/5] Generating {len(visual_prompts)} images via FAL FLUX...")
+def generate_images(visual_prompts: list[str], slug: str) -> tuple[list[Path], dict]:
+    """Returns (image_paths, cost_info). Runs in parallel with caching."""
+    n = len(visual_prompts)
+    print(f"[3/5] Generating {n} images via FAL FLUX...")
     img_dir = OUTPUT_DIR / f"{slug}_images"
     img_dir.mkdir(exist_ok=True)
-    image_paths = []
+    image_paths: list[Path | None] = [None] * n
+    cost_info = {"generated": 0, "reused": 0}
 
-    for i, prompt in enumerate(visual_prompts):
-        print(f"   Image {i+1}/{len(visual_prompts)}...")
+    def _one(i: int, prompt: str) -> tuple[int, Path, str]:
+        cache_key  = _hash(prompt)
+        cache_path = CACHE_DIR / "images" / f"{cache_key}.jpg"
+        img_path   = img_dir / f"img_{i:02d}.jpg"
+
+        if ENABLE_ASSET_CACHE and cache_path.exists():
+            shutil.copy2(cache_path, img_path)
+            return i, img_path, "reused"
+
         result = fal_client.run(
             "fal-ai/flux/schnell",
             arguments={
@@ -237,17 +292,25 @@ def generate_images(visual_prompts: list[str], slug: str) -> list[Path]:
                 "enable_safety_checker": False,
             },
         )
-        url = result["images"][0]["url"]
-        img_path = img_dir / f"img_{i:02d}.jpg"
+        url      = result["images"][0]["url"]
         img_data = requests.get(url, timeout=60).content
         img_path.write_bytes(img_data)
-        image_paths.append(img_path)
-        print(f"   ✓ saved {img_path.name}")
+        if ENABLE_ASSET_CACHE:
+            cache_path.write_bytes(img_data)
+        return i, img_path, "generated"
 
-    return image_paths
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {executor.submit(_one, i, p): i for i, p in enumerate(visual_prompts)}
+        for fut in as_completed(futures):
+            i, path, status = fut.result()
+            image_paths[i] = path
+            cost_info[status] += 1
+            print(f"   ✓ img_{i:02d} ({status})")
+
+    return image_paths, cost_info
 
 
-# ─── Step 4: Kling image-to-video ─────────────────────────────────────────────
+# ─── Step 4a: Kling image-to-video (hero scenes) ──────────────────────────────
 
 def _kling_jwt() -> str:
     payload = {
@@ -260,14 +323,13 @@ def _kling_jwt() -> str:
 
 
 def _kling_submit(image_path: Path, motion_prompt: str) -> str:
-    """Submit image-to-video task. Sends image as base64 to avoid CDN restrictions."""
     img_b64 = base64.b64encode(image_path.read_bytes()).decode()
     payload = {
         "model_name": "kling-v1",
-        "image": img_b64,
-        "prompt": motion_prompt,
-        "duration": "5",
-        "mode": "std",
+        "image":       img_b64,
+        "prompt":      motion_prompt,
+        "duration":    "5",
+        "mode":        "std",
         "aspect_ratio": "9:16",
     }
     for attempt, wait in enumerate([0, 30, 60, 120]):
@@ -310,7 +372,7 @@ def _kling_poll(task_id: str, timeout: int = 300) -> str:
         data = resp.json()
         if data.get("code") != 0:
             raise RuntimeError(f"Kling poll error: {data}")
-        task = data["data"]
+        task   = data["data"]
         status = task.get("task_status", "")
         if status == "succeed":
             return task["task_result"]["videos"][0]["url"]
@@ -333,42 +395,151 @@ MOTION_PROMPTS = [
     "slow pan right, soft depth of field",
 ]
 
+KLING_CONCURRENCY = 3
 
-KLING_CONCURRENCY = 3  # 3 concurrent to avoid 429 rate limits
+
+# ─── Step 4b: FFmpeg zoompan motion (non-hero scenes) ─────────────────────────
+
+# 12-position preset cycle — varied so sequential scenes don't look identical
+_FFMPEG_MOTION_CYCLE = [
+    "slow_zoom_in", "pan_left",     "slow_zoom_out", "drift_up",
+    "pan_right",    "slow_zoom_in", "pan_left",      "slow_zoom_out",
+    "drift_up",     "pan_right",    "slow_zoom_in",  "slow_zoom_out",
+]
 
 
-def animate_images(image_paths: list[Path], slug: str) -> list[Path]:
-    print(f"[4/5] Animating {len(image_paths)} images with Kling...")
+def _motion_vf(preset: str, n_frames: int = 125) -> str:
+    # Scale+crop to 1440x2560 first (gives 33% headroom for zoom/pan into 1080x1920 output)
+    d  = n_frames
+    sc = "scale=1440:2560:force_original_aspect_ratio=increase,crop=1440:2560"
+    zp = f"d={d}:s=1080x1920:fps=25"
+    cx = "iw/2-(iw/zoom/2)"
+    cy = "ih/2-(ih/zoom/2)"
+    table = {
+        "slow_zoom_in":  f"{sc},zoompan=z='min(zoom+0.002,1.25)':x='{cx}':y='{cy}':{zp}",
+        "slow_zoom_out": f"{sc},zoompan=z='if(lte(zoom,1.0),1.25,max(1.01,zoom-0.002))':x='{cx}':y='{cy}':{zp}",
+        "pan_left":      f"{sc},zoompan=z=1.2:x='if(lte(on,1),0,min(iw*(1-1/zoom),x+1.5))':y='{cy}':{zp}",
+        "pan_right":     f"{sc},zoompan=z=1.2:x='if(lte(on,1),iw*(1-1/zoom),max(0,x-1.5))':y='{cy}':{zp}",
+        "drift_up":      f"{sc},zoompan=z=1.2:x='{cx}':y='if(lte(on,1),ih*(1-1/zoom),max(0,y-1.5))':{zp}",
+    }
+    return table.get(preset, table["slow_zoom_in"])
+
+
+def _ffmpeg_motion_clip(image_path: Path, clip_path: Path, preset: str, duration: float = 5.0) -> Path:
+    fps      = 25
+    n_frames = int(duration * fps)
+    vf       = _motion_vf(preset, n_frames)
+    cmd = [
+        FFMPEG_EXE, "-y",
+        "-loop", "1",
+        "-i", str(image_path),
+        "-vf", vf,
+        "-t", str(duration),
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-pix_fmt", "yuv420p",
+        str(clip_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+    if result.returncode != 0:
+        raise RuntimeError(f"FFmpeg motion failed for {clip_path.name}: {result.stderr[-400:]}")
+    return clip_path
+
+
+# ─── Step 4: Animate (hybrid dispatcher) ──────────────────────────────────────
+
+def _hero_indices(n_scenes: int) -> set[int]:
+    if HERO_SCENE_INDICES:
+        return {i for i in HERO_SCENE_INDICES if i < n_scenes}
+    count = min(HERO_SCENE_COUNT, n_scenes)
+    if count >= 4 and n_scenes >= 4:
+        mid = n_scenes // 2
+        return {0, mid, n_scenes - 2, n_scenes - 1}
+    if count >= 3 and n_scenes >= 3:
+        return {0, n_scenes - 2, n_scenes - 1}
+    if count >= 2:
+        return {0, n_scenes - 1}
+    return {0}
+
+
+def animate_images(image_paths: list[Path], slug: str) -> tuple[list[Path], dict]:
+    """
+    Returns (clip_paths, cost_info).
+    cost_info keys: kling_generated, kling_reused, ffmpeg_clips, kling_units_used
+    """
+    n         = len(image_paths)
+    heroes    = _hero_indices(n) if VIDEO_MODE == "hybrid" else (set(range(n)) if VIDEO_MODE == "full_kling" else set())
+    ffmpeg_ct = n - len(heroes) if VIDEO_MODE == "hybrid" else (0 if VIDEO_MODE == "full_kling" else n)
+
+    print(f"[4/5] Animating {n} images (mode={VIDEO_MODE}, kling={len(heroes)}, ffmpeg={ffmpeg_ct})...")
+    if heroes:
+        print(f"   Hero scenes (Kling): {sorted(heroes)}")
+
     clip_dir = OUTPUT_DIR / f"{slug}_clips"
     clip_dir.mkdir(exist_ok=True)
 
-    video_paths = []
-    for batch_start in range(0, len(image_paths), KLING_CONCURRENCY):
-        batch = image_paths[batch_start: batch_start + KLING_CONCURRENCY]
-        batch_indices = list(range(batch_start, batch_start + len(batch)))
+    cost = {"kling_generated": 0, "kling_reused": 0, "ffmpeg_clips": 0, "kling_units_used": 0.0}
+    video_paths: list[Path | None] = [None] * n
 
-        task_ids = []
-        for i, img_path in zip(batch_indices, batch):
-            motion = MOTION_PROMPTS[i % len(MOTION_PROMPTS)]
-            print(f"   Submitting clip {i+1}/{len(image_paths)}...")
-            task_id = _kling_submit(img_path, motion)
-            task_ids.append((i, task_id))
-            time.sleep(1)
+    # ── Kling hero scenes ──────────────────────────────────────────────────
+    kling_queue: list[tuple[int, str]] = []   # (scene_index, task_id)
 
-        for i, task_id in task_ids:
-            print(f"   Waiting for clip {i+1}/{len(image_paths)} (task {task_id})...")
-            video_url = _kling_poll(task_id)
-            clip_path = clip_dir / f"clip_{i:02d}.mp4"
-            r = requests.get(video_url, timeout=120)
+    for i in sorted(heroes):
+        img_path   = image_paths[i]
+        clip_path  = clip_dir / f"clip_{i:02d}.mp4"
+        motion     = MOTION_PROMPTS[i % len(MOTION_PROMPTS)]
+        img_bytes  = img_path.read_bytes()
+        cache_key  = _hash(f"{_hash_bytes(img_bytes)}:{motion}")
+        cache_path = CACHE_DIR / "kling" / f"{cache_key}.mp4"
+
+        if ENABLE_KLING_RESUME and clip_path.exists() and clip_path.stat().st_size > 10_000:
+            print(f"   ✓ Clip {i+1} resumed (on disk)")
+            video_paths[i] = clip_path
+            cost["kling_reused"] += 1
+            continue
+
+        if ENABLE_ASSET_CACHE and cache_path.exists():
+            shutil.copy2(cache_path, clip_path)
+            print(f"   ✓ Clip {i+1} from cache (Kling)")
+            video_paths[i] = clip_path
+            cost["kling_reused"] += 1
+            continue
+
+        print(f"   Submitting Kling clip {i+1}/{n} (hero)...")
+        task_id = _kling_submit(img_path, motion)
+        kling_queue.append((i, task_id, clip_path, cache_key))
+
+    # Poll Kling submissions in batches of KLING_CONCURRENCY
+    for batch_start in range(0, len(kling_queue), KLING_CONCURRENCY):
+        batch = kling_queue[batch_start: batch_start + KLING_CONCURRENCY]
+        for i, task_id, clip_path, cache_key in batch:
+            print(f"   Waiting for clip {i+1} (task {task_id})...")
+            video_url  = _kling_poll(task_id)
+            r          = requests.get(video_url, timeout=120)
             r.raise_for_status()
             clip_path.write_bytes(r.content)
-            print(f"   ✓ Clip {i+1} saved ({len(r.content)//1024}KB)")
-            video_paths.append(clip_path)
+            if ENABLE_ASSET_CACHE:
+                (CACHE_DIR / "kling" / f"{cache_key}.mp4").write_bytes(r.content)
+            print(f"   ✓ Clip {i+1} saved ({len(r.content) // 1024}KB)")
+            video_paths[i] = clip_path
+            cost["kling_generated"] += 1
+            cost["kling_units_used"] += 1.5
 
-    return video_paths
+    # ── FFmpeg non-hero scenes ─────────────────────────────────────────────
+    for i, img_path in enumerate(image_paths):
+        if video_paths[i] is not None:
+            continue
+        clip_path = clip_dir / f"clip_{i:02d}.mp4"
+        preset    = _FFMPEG_MOTION_CYCLE[i % len(_FFMPEG_MOTION_CYCLE)]
+        print(f"   FFmpeg clip {i+1}/{n} ({preset})...")
+        _ffmpeg_motion_clip(img_path, clip_path, preset)
+        print(f"   ✓ Clip {i+1} ready")
+        video_paths[i] = clip_path
+        cost["ffmpeg_clips"] += 1
+
+    return video_paths, cost
 
 
-# ─── Step 5: FFmpeg assembly ──────────────────────────────────────────────────
+# ─── Step 5: FFmpeg assembly ───────────────────────────────────────────────────
 
 def _get_audio_duration(audio_path: Path) -> float:
     result = subprocess.run(
@@ -387,9 +558,9 @@ def _build_caption_chunks(boundaries: list[dict], chunk_size: int = 4) -> list[d
     for i in range(0, len(boundaries), chunk_size):
         group = boundaries[i: i + chunk_size]
         chunks.append({
-            "text":  " ".join(w["word"] for w in group),
-            "start": group[0]["start"],
-            "end":   group[-1]["end"],
+            "words":  [w["word"] for w in group],
+            "start":  group[0]["start"],
+            "end":    group[-1]["end"],
         })
     return chunks
 
@@ -403,22 +574,17 @@ def assemble_video(
 ) -> Path:
     print("[5/5] Assembling final video...")
 
-    audio_duration = _get_audio_duration(audio_path)
-    out_path = OUTPUT_DIR / f"{slug}.mp4"
-
-    # Build FFmpeg concat + stretch to match audio
-    # Each clip is 5s; total clip duration = 5 * n_clips
-    n_clips = len(clip_paths)
-    clip_duration = 5.0
+    audio_duration      = _get_audio_duration(audio_path)
+    out_path            = OUTPUT_DIR / f"{slug}.mp4"
+    n_clips             = len(clip_paths)
+    clip_duration       = 5.0
     total_clip_duration = n_clips * clip_duration
 
-    # Write concat list
     concat_file = OUTPUT_DIR / f"{slug}_concat.txt"
     with open(concat_file, "w") as f:
         for cp in clip_paths:
             f.write(f"file '{cp.resolve()}'\n")
 
-    # Step A: Concat all clips into a silent video
     silent_path = OUTPUT_DIR / f"{slug}_silent.mp4"
     subprocess.run(
         [FFMPEG_EXE, "-y",
@@ -429,12 +595,10 @@ def assemble_video(
         check=True, capture_output=True,
     )
 
-    # Step B: Stretch/loop silent video to match audio duration
     stretched_path = OUTPUT_DIR / f"{slug}_stretched.mp4"
     if total_clip_duration < audio_duration:
-        # Need to stretch — slow down video proportionally
-        speed_factor = total_clip_duration / audio_duration  # < 1 = slow down
-        pts_factor = 1.0 / speed_factor
+        speed_factor = total_clip_duration / audio_duration
+        pts_factor   = 1.0 / speed_factor
         subprocess.run(
             [FFMPEG_EXE, "-y",
              "-i", str(silent_path),
@@ -444,7 +608,6 @@ def assemble_video(
             check=True, capture_output=True,
         )
     else:
-        # Trim to audio duration
         subprocess.run(
             [FFMPEG_EXE, "-y",
              "-i", str(silent_path),
@@ -454,17 +617,16 @@ def assemble_video(
             check=True, capture_output=True,
         )
 
-    # Step C: Build word-by-word karaoke captions (ASS format)
     def _ass_time(t: float) -> str:
-        h = int(t // 3600)
-        m = int((t % 3600) // 60)
-        s = t % 60
+        h  = int(t // 3600)
+        m  = int((t % 3600) // 60)
+        s  = t % 60
         cs = int((s % 1) * 100)
         return f"{h}:{m:02d}:{int(s):02d}.{cs:02d}"
 
-    # Find a good font — prefer Impact (TikTok style), fall back to Helvetica
     caption_font = "Impact"
-    for fp in ["/Library/Fonts/Impact.ttf", "/System/Library/Fonts/Impact.ttf"]:
+    for fp in ["/Library/Fonts/Impact.ttf", "/System/Library/Fonts/Impact.ttf",
+               "/usr/share/fonts/truetype/msttcorefonts/Impact.ttf"]:
         if os.path.exists(fp):
             caption_font = "Impact"
             break
@@ -480,36 +642,27 @@ def assemble_video(
                 "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
                 "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
                 "Alignment, MarginL, MarginR, MarginV, Encoding\n")
-        # White bold text, thick black outline, bottom-center at MarginV=160
         f.write(f"Style: Default,{caption_font},72,&H00FFFFFF,&H00FFFFFF,"
                 f"&H00000000,&H00000000,1,0,0,0,100,100,2,0,1,4,0,2,30,30,160,1\n")
-        # Highlighted word style — yellow
         f.write(f"Style: Highlight,{caption_font},72,&H0000FFFF,&H0000FFFF,"
                 f"&H00000000,&H00000000,1,0,0,0,100,100,2,0,1,4,0,2,30,30,160,1\n\n")
         f.write("[Events]\n")
         f.write("Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n")
 
-        # Group words into lines of 3 words max (karaoke per line)
         if word_boundaries:
             i = 0
             while i < len(word_boundaries):
-                group = word_boundaries[i: i + 3]
+                group      = word_boundaries[i: i + 3]
                 line_start = group[0]["start"]
                 line_end   = group[-1]["end"]
-
-                # Build karaoke line: each word tagged with its duration in centiseconds
                 parts = []
                 for w in group:
                     dur_cs = max(1, int((w["end"] - w["start"]) * 100))
                     parts.append(f"{{\\k{dur_cs}}}{w['word'].upper()}")
-
                 line_text = " ".join(parts)
                 f.write(f"Dialogue: 0,{_ass_time(line_start)},{_ass_time(line_end)},"
                         f"Default,,0,0,0,,{line_text}\n")
                 i += 3
-
-    # Step D: Mux audio + burn ASS subtitles
-    srt_path = ass_path  # reuse variable for the filter path
 
     subprocess.run(
         [FFMPEG_EXE, "-y",
@@ -527,28 +680,87 @@ def assemble_video(
         check=True, capture_output=True,
     )
 
-    # Cleanup temp files
     silent_path.unlink(missing_ok=True)
     stretched_path.unlink(missing_ok=True)
     concat_file.unlink(missing_ok=True)
+    ass_path.unlink(missing_ok=True)
 
     print(f"\n✅ Video ready: {out_path}")
     return out_path
 
 
+# ─── Cost summary ─────────────────────────────────────────────────────────────
+
+_KLING_UNIT_COST  = 0.098   # USD per unit (std mode)
+_FAL_IMAGE_COST   = 0.003   # USD per FLUX schnell image
+_ELEVENLABS_COST  = 0.05    # USD approximate per video (Starter plan)
+_CLAUDE_COST      = 0.02    # USD approximate per script
+
+
+def print_cost_summary(
+    img_cost:  dict,
+    clip_cost: dict,
+    audio_duration: float,
+    video_duration: float,
+    voice_reused: bool = False,
+    script_reused: bool = False,
+):
+    kling_total = clip_cost["kling_generated"] + clip_cost["kling_reused"]
+    fal_gen     = img_cost["generated"]
+    fal_reused  = img_cost["reused"]
+
+    kling_usd   = clip_cost["kling_units_used"] * _KLING_UNIT_COST
+    fal_usd     = fal_gen * _FAL_IMAGE_COST
+    el_usd      = 0.0 if voice_reused else _ELEVENLABS_COST
+    claude_usd  = 0.0 if script_reused else _CLAUDE_COST
+    total_usd   = kling_usd + fal_usd + el_usd + claude_usd
+
+    generated_secs = kling_total * 5.0
+    waste_pct      = max(0, (generated_secs - video_duration) / generated_secs * 100) if generated_secs else 0
+
+    print("\n" + "═" * 50)
+    print("📊 COST SUMMARY")
+    print(f"   Mode:          {VIDEO_MODE}")
+    print(f"   FAL images:    generated={fal_gen}, reused={fal_reused}  (~${fal_usd:.3f})")
+    print(f"   Kling clips:   generated={clip_cost['kling_generated']}, reused={clip_cost['kling_reused']}  "
+          f"(~{clip_cost['kling_units_used']:.1f} units / ~${kling_usd:.2f})")
+    print(f"   FFmpeg clips:  {clip_cost['ffmpeg_clips']}  ($0.00)")
+    print(f"   ElevenLabs:    {'reused' if voice_reused else f'~${el_usd:.2f}'}")
+    print(f"   Claude:        {'reused' if script_reused else f'~${claude_usd:.2f}'}")
+    print(f"   ─────────────────────────────────────")
+    print(f"   TOTAL:         ~${total_usd:.2f}")
+    print(f"   Video:         {video_duration:.1f}s final  |  {generated_secs:.0f}s Kling generated  |  {waste_pct:.0f}% waste")
+    print("═" * 50 + "\n")
+
+    return {
+        "total_usd":       round(total_usd, 3),
+        "kling_units":     clip_cost["kling_units_used"],
+        "fal_generated":   fal_gen,
+        "fal_reused":      fal_reused,
+        "kling_generated": clip_cost["kling_generated"],
+        "kling_reused":    clip_cost["kling_reused"],
+        "ffmpeg_clips":    clip_cost["ffmpeg_clips"],
+        "video_seconds":   round(video_duration, 1),
+    }
+
+
 # ─── Main entry points ────────────────────────────────────────────────────────
 
-def generate_video(topic: str) -> Path:
+def generate_video(topic: str) -> tuple[Path, dict]:
+    """Returns (video_path, cost_summary_dict)."""
     slug = re.sub(r"[^a-z0-9]+", "_", topic.lower())[:40] + f"_{int(time.time())}"
 
-    script_data          = generate_script(topic)
-    audio_path, words    = generate_tts(script_data["script"], slug)
-    image_urls           = generate_images(script_data["visual_prompts"], slug)
-    clip_paths           = animate_images(image_urls, slug)
-    video_path           = assemble_video(clip_paths, audio_path, words, script_data, slug)
+    script_data        = generate_script(topic)
+    audio_path, words  = generate_tts(script_data["script"], slug)
+    image_paths, i_cost = generate_images(script_data["visual_prompts"], slug)
+    clip_paths, c_cost  = animate_images(image_paths, slug)
+    video_path         = assemble_video(clip_paths, audio_path, words, script_data, slug)
+
+    audio_dur  = _get_audio_duration(audio_path)
+    cost_summary = print_cost_summary(i_cost, c_cost, audio_dur, audio_dur)
 
     print(f"\n📋 Caption:\n{script_data['tiktok_caption']}")
-    return video_path
+    return video_path, cost_summary
 
 
 if __name__ == "__main__":
