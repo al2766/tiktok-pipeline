@@ -275,80 +275,150 @@ def analyze_status(job_id: str):
 
 # ─── topic suggestions ────────────────────────────────────────────────────────
 
-# Proven science/facts channels — ordered by similarity to @provenweird.
-# Strategy: skip their most recent 30 videos (competing timeframe).
-# Scrape items 31–55: proven topics from ~3–6 months ago, zero overlap risk.
+# Channels to visit via Playwright — 3 per call, positions 30/31/32 = 9 topics
 INSPIRATION_ACCOUNTS = [
-    "https://www.tiktok.com/@scitrendz",      # science trends / nature facts
-    "https://www.tiktok.com/@factsverse",     # science / history oddities
-    "https://www.tiktok.com/@mindfacts",      # psychology / mind facts
-    "https://www.tiktok.com/@theweirdworld",  # weird science / history
+    "https://www.tiktok.com/@scitrendz",
+    "https://www.tiktok.com/@factsverse",
+    "https://www.tiktok.com/@mindfacts",
 ]
 
-# Skip this many recent videos (their newest content = competing timeframe)
-_SKIP_RECENT = 30
-_FETCH_COUNT = 25  # how many older videos to pull per account
+VIDEO_POSITIONS = [30, 31, 32]  # skip newest 29, use videos at these positions
+
+
+def _playwright_get_channel_videos(channel_url: str, positions: list) -> list:
+    """
+    Opens TikTok channel with headless Chromium, scrolls until the target
+    video positions are loaded, visits each video page and extracts its
+    description text. Returns a list of dicts with channel/position/url/text.
+    """
+    from playwright.sync_api import sync_playwright
+
+    handle = channel_url.rstrip("/").split("@")[-1]
+    results = []
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+            )
+            ctx = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                    "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                    "Version/17.0 Mobile/15E148 Safari/604.1"
+                ),
+                viewport={"width": 390, "height": 844},
+                locale="en-US",
+            )
+            page = ctx.new_page()
+            page.goto(channel_url, wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(3000)
+
+            # Scroll until we have at least max(positions)+3 video links loaded
+            target = max(positions) + 3
+            for _ in range(30):
+                links = page.locator('a[href*="/video/"]').all()
+                if len(links) >= target:
+                    break
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                page.wait_for_timeout(1800)
+
+            links = page.locator('a[href*="/video/"]').all()
+            print(f"[{handle}] {len(links)} video links loaded")
+
+            for pos in positions:
+                idx = pos - 1
+                if idx >= len(links):
+                    print(f"[{handle}] only {len(links)} links, can't reach #{pos}")
+                    continue
+
+                href = links[idx].get_attribute("href") or ""
+                if not href:
+                    continue
+                if href.startswith("/"):
+                    href = f"https://www.tiktok.com{href}"
+
+                # Visit the video page to extract its description / caption text
+                vp = ctx.new_page()
+                try:
+                    vp.goto(href, wait_until="domcontentloaded", timeout=20000)
+                    vp.wait_for_timeout(2500)
+
+                    text = ""
+                    for sel in [
+                        '[data-e2e="video-desc"]',
+                        '[data-e2e="browse-video-desc"]',
+                        'h1[data-e2e]',
+                        'span[class*="SpanText"]',
+                        "h1",
+                    ]:
+                        try:
+                            t = vp.locator(sel).first.inner_text(timeout=2000).strip()
+                            if t and len(t) > 5:
+                                text = t[:500]
+                                break
+                        except Exception:
+                            pass
+
+                    results.append({"channel": handle, "position": pos, "url": href, "text": text})
+                    print(f"[{handle}] #{pos}: {text[:80]}")
+                except Exception as e:
+                    results.append({"channel": handle, "position": pos, "url": href, "text": "", "error": str(e)})
+                finally:
+                    vp.close()
+
+            browser.close()
+
+    except Exception as e:
+        print(f"Playwright error for {channel_url}: {e}")
+
+    return results
+
 
 @app.route("/suggest-topics", methods=["GET"])
 def suggest_topics():
     """
-    Fetches older video titles from proven science channels (skips their newest
-    _SKIP_RECENT videos to avoid topic overlap), then uses Claude Haiku to
-    generate 8 inspired but original topic suggestions.
+    Uses Playwright to visit each inspiration channel, fetches the video at
+    positions 30, 31, 32 (3 channels × 3 positions = 9 videos). Returns 9
+    topic ideas — one per video — so the user can verify by counting down
+    to those exact positions on each channel.
     """
-    import subprocess, shutil
+    all_videos = []
+    for account_url in INSPIRATION_ACCOUNTS:
+        videos = _playwright_get_channel_videos(account_url, VIDEO_POSITIONS)
+        all_videos.extend(videos)
 
-    yt_dlp = shutil.which("yt-dlp") or "yt-dlp"
-    raw_titles = []
+    if not all_videos:
+        # Playwright unavailable or all channels blocked — Claude fallback
+        import time as _t
+        prompt = f"""You are a TikTok science content strategist for @provenweird.
 
-    playlist_range = f"{_SKIP_RECENT + 1}:{_SKIP_RECENT + _FETCH_COUNT + 1}"
+Generate 9 ORIGINAL topic ideas for 60-second science/facts videos. Cover biology, physics, psychology, space, ocean, human body, animals, historical paradoxes. Each topic must have a built-in paradox, counterintuitive angle, or philosophical hook. No "Did you know". Vary the formula. Each phrase 10-20 words max.
 
-    for account_url in INSPIRATION_ACCOUNTS[:3]:  # limit to 3 accounts per call
-        try:
-            result = subprocess.run(
-                [yt_dlp, "--flat-playlist", "--playlist-items", playlist_range,
-                 "--print", "%(title)s|||%(description)s",
-                 "--no-warnings", "--quiet", account_url],
-                capture_output=True, text=True, timeout=25
-            )
-            for line in result.stdout.strip().split("\n"):
-                if line.strip():
-                    raw_titles.append(line.strip()[:200])
-        except Exception:
-            pass
+Seed: {int(_t.time())}
 
-    import time as _time
-    seed = int(_time.time())  # ensures different results every call
-
-    if not raw_titles:
-        # yt-dlp scraping blocked on this server IP — ask Claude directly
-        prompt = f"""You are a TikTok science content strategist for @provenweird — a dry, sardonic science facts channel.
-
-Generate 8 ORIGINAL, varied topic ideas that would make great 60-second science/facts videos. Each should be a single punchy phrase (10-20 words max) with a built-in paradox, counterintuitive fact, or philosophical angle.
-
-Focus on: biology, physics, psychology, space, ocean, human body, animal facts, historical paradoxes.
-
-Rules:
-- NEVER reuse topics from previous suggestions
-- Vary the angle: use paradoxes, myth-busts, existential hooks, stakes-first openings
-- No "Did you know" framing
-- Seed for variety: {seed}
-
-Return ONLY a JSON array of 8 strings. No markdown. No explanation."""
+Return ONLY a JSON array of 9 strings. No markdown."""
+        source = "claude_fallback"
     else:
-        sample = "\n".join(raw_titles[:30])
-        prompt = f"""You are a TikTok science content strategist. Below are older video titles from successful science facts channels (scraped from positions 31-55 in their feed — proven topics, no overlap risk).
+        lines = [
+            f"@{v['channel']} video #{v['position']}: {v['text'] or '(no caption extracted)'}"
+            for v in all_videos
+        ]
+        sample = "\n".join(lines)
+        prompt = f"""You are a TikTok science content strategist for @provenweird.
 
-Study the topics, angles, and hooks. Then generate 8 ORIGINAL topic ideas inspired by this style — NOT copies, but new topics using the same energy and angles. Each should be a single punchy topic phrase (10-20 words max) that would work as a @provenweird video.
+Below are the actual captions/descriptions of {len(all_videos)} videos at positions 30–32 on 3 successful science facts channels. These are proven topics from ~3–6 months ago.
 
-Focus on: biology, physics, psychology, space, ocean, human body, animal facts, historical paradoxes.
+For EACH video listed, generate ONE inspired but wholly original topic idea that captures the same energy and angle but uses a completely different fact. Output exactly {len(all_videos)} topics in the same order so they can be mapped back to each video.
 
-Source content:
+Videos:
 {sample}
 
-Seed for variety: {seed}
+Rules: no "Did you know", each topic 10-20 words max, dry sardonic tone, vary the formula.
 
-Return ONLY a JSON array of 8 strings. No markdown. No explanation."""
+Return ONLY a JSON array of {len(all_videos)} strings. No markdown. No explanation."""
+        source = "playwright"
 
     resp = http_requests.post(
         "https://api.anthropic.com/v1/messages",
@@ -359,10 +429,10 @@ Return ONLY a JSON array of 8 strings. No markdown. No explanation."""
         },
         json={
             "model": "claude-haiku-4-5-20251001",
-            "max_tokens": 400,
+            "max_tokens": 600,
             "messages": [{"role": "user", "content": prompt}],
         },
-        timeout=20,
+        timeout=30,
     )
     resp.raise_for_status()
     raw = resp.json()["content"][0]["text"].strip()
@@ -370,7 +440,13 @@ Return ONLY a JSON array of 8 strings. No markdown. No explanation."""
         raw = raw.split("```")[1].lstrip("json").strip()
         raw = raw.rsplit("```", 1)[0].strip()
     topics = json.loads(raw)
-    return jsonify({"topics": topics, "source_count": len(raw_titles), "source": "scraped" if raw_titles else "claude"})
+
+    return jsonify({
+        "topics": topics,
+        "source": source,
+        "source_count": len(all_videos),
+        "videos": all_videos,   # channel + position + url + text — for verification
+    })
 
 
 # ─── health ────────────────────────────────────────────────────────────────────
