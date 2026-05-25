@@ -10,7 +10,7 @@ GET  /oauth/status                                      → { "authorized": true
 
 import os, uuid, threading, base64, json
 from pathlib import Path
-from flask import Flask, request, jsonify, redirect, send_file
+from flask import Flask, request, jsonify, redirect
 from flask_cors import CORS
 from dotenv import load_dotenv
 import requests as http_requests
@@ -26,7 +26,7 @@ from pipeline import generate_video, generate_script, generate_images, generate_
 app = Flask(__name__)
 CORS(app)
 
-jobs: dict = {}   # job_id → { status, step, caption, error, video_path }
+jobs: dict = {}   # job_id → { status, video_b64, caption, error }
 
 TIKTOK_CLIENT_KEY    = os.environ.get("TIKTOK_CLIENT_KEY", "")
 TIKTOK_CLIENT_SECRET = os.environ.get("TIKTOK_CLIENT_SECRET", "")
@@ -62,32 +62,24 @@ def _run_job(job_id: str, topic: str):
         jobs[job_id]["caption"] = script_data.get("tiktok_caption", "")
 
         jobs[job_id]["step"] = "images"
-        image_paths, img_cost = generate_images(script_data["visual_prompts"], slug)
+        image_paths = generate_images(script_data["visual_prompts"], slug)
 
         jobs[job_id]["step"] = "voice"
         audio_path, word_boundaries = generate_tts(script_data["script"], slug)
 
         jobs[job_id]["step"] = "animation"
-        clip_paths, clip_cost = animate_images(image_paths, slug)
+        clip_paths = animate_images(image_paths, slug)
 
         jobs[job_id]["step"] = "assembly"
         video_path = assemble_video(clip_paths, audio_path, word_boundaries, script_data, slug)
 
-        # Store path only — never load video into RAM
-        jobs[job_id]["video_path"] = str(video_path)
+        with open(video_path, "rb") as f:
+            jobs[job_id]["video_b64"] = base64.b64encode(f.read()).decode()
 
-        # Log cost summary
-        from pipeline import _get_audio_duration, print_cost_summary
-        audio_dur    = _get_audio_duration(audio_path)
-        cost_summary = print_cost_summary(img_cost, clip_cost, audio_dur, audio_dur)
-        jobs[job_id]["cost"] = cost_summary
-
-        # Cleanup all intermediates immediately
+        # Cleanup intermediates
         for p in image_paths:
             p.unlink(missing_ok=True)
         audio_path.unlink(missing_ok=True)
-        for p in clip_paths:
-            p.unlink(missing_ok=True)
 
         jobs[job_id]["status"] = "done"
         jobs[job_id]["step"] = "done"
@@ -107,7 +99,7 @@ def generate():
         return jsonify({"error": "topic required"}), 400
 
     job_id = str(uuid.uuid4())
-    jobs[job_id] = {"status": "pending", "step": None, "caption": None, "error": None, "video_path": None}
+    jobs[job_id] = {"status": "pending", "video_b64": None, "caption": None, "error": None}
 
     thread = threading.Thread(target=_run_job, args=(job_id, topic), daemon=True)
     thread.start()
@@ -120,19 +112,7 @@ def status(job_id: str):
     job = jobs.get(job_id)
     if not job:
         return jsonify({"status": "not_found"}), 404
-    # Never return video bytes in status — frontend fetches /download separately
-    return jsonify({k: v for k, v in job.items() if k != "video_path"})
-
-
-@app.route("/download/<job_id>")
-def download(job_id: str):
-    job = jobs.get(job_id)
-    if not job or job["status"] != "done":
-        return jsonify({"error": "not ready"}), 404
-    video_path = job.get("video_path")
-    if not video_path or not Path(video_path).exists():
-        return jsonify({"error": "video file missing"}), 404
-    return send_file(video_path, mimetype="video/mp4", as_attachment=False)
+    return jsonify(job)
 
 
 # ─── TikTok OAuth ──────────────────────────────────────────────────────────────
@@ -197,12 +177,8 @@ def post_to_tiktok():
     if not tokens:
         return jsonify({"error": "not_authorized", "auth_url": f"{RENDER_URL}/oauth/start"}), 401
 
-    video_path = job.get("video_path")
-    if not video_path or not Path(video_path).exists():
-        return jsonify({"error": "video file missing — regenerate"}), 400
-
     access_token = tokens["access_token"]
-    video_bytes  = Path(video_path).read_bytes()
+    video_bytes  = base64.b64decode(job["video_b64"])
     video_size   = len(video_bytes)
 
     # Init upload
