@@ -11,8 +11,7 @@ Pipeline:
   5. FFmpeg  → concat clips + mux audio + burn animated captions
 """
 
-import os, json, re, time, subprocess, base64, gc, requests, textwrap, asyncio
-import jwt
+import os, json, re, time, subprocess, base64, requests, textwrap, asyncio
 from pathlib import Path
 from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFont
@@ -22,8 +21,6 @@ load_dotenv()
 
 ANTHROPIC_API_KEY  = os.environ["ANTHROPIC_API_KEY"]
 ELEVENLABS_API_KEY = os.environ["ELEVENLABS_API_KEY"]
-KLING_ACCESS_KEY   = os.environ["KLING_ACCESS_KEY"]
-KLING_SECRET_KEY   = os.environ["KLING_SECRET_KEY"]
 FAL_KEY            = os.environ["FAL_KEY"]
 os.environ["FAL_KEY"] = FAL_KEY
 
@@ -247,115 +244,52 @@ def generate_images(visual_prompts: list[str], slug: str) -> list[Path]:
     return image_paths
 
 
-# ─── Step 4: Kling image-to-video ─────────────────────────────────────────────
+# ─── Step 4: FFmpeg zoompan animation ─────────────────────────────────────────
 
-def _kling_jwt() -> str:
-    payload = {
-        "iss": KLING_ACCESS_KEY,
-        "exp": int(time.time()) + 1800,
-        "nbf": int(time.time()) - 5,
-    }
-    return jwt.encode(payload, KLING_SECRET_KEY, algorithm="HS256",
-                      headers={"alg": "HS256", "typ": "JWT"})
-
-
-def _kling_submit(image_path: Path, motion_prompt: str) -> str:
-    """Submit image-to-video task. Sends image as base64 to avoid CDN restrictions."""
-    token = _kling_jwt()
-    img_b64 = base64.b64encode(image_path.read_bytes()).decode()
-    resp = requests.post(
-        "https://api.klingai.com/v1/videos/image2video",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model_name": "kling-v1",
-            "image": img_b64,
-            "prompt": motion_prompt,
-            "duration": "5",
-            "mode": "std",
-            "aspect_ratio": "9:16",
-        },
-        timeout=30,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    if data.get("code") != 0:
-        raise RuntimeError(f"Kling submit failed: {data}")
-    task_id = data["data"]["task_id"]
-    print(f"   Submitted task {task_id}")
-    return task_id
-
-
-def _kling_poll(task_id: str, timeout: int = 300) -> str:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        time.sleep(10)
-        token = _kling_jwt()
-        resp = requests.get(
-            f"https://api.klingai.com/v1/videos/image2video/{task_id}",
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        if data.get("code") != 0:
-            raise RuntimeError(f"Kling poll error: {data}")
-        task = data["data"]
-        status = task.get("task_status", "")
-        if status == "succeed":
-            return task["task_result"]["videos"][0]["url"]
-        if status == "failed":
-            raise RuntimeError(f"Kling task failed: {task.get('task_status_msg')}")
-        print(f"   Kling {task_id}: {status}...")
-    raise RuntimeError(f"Kling task {task_id} timed out")
-
-
-MOTION_PROMPTS = [
-    "slow cinematic zoom in, gentle camera drift",
-    "slow pull back, soft ambient motion",
-    "subtle camera pan left, dreamy atmosphere",
-    "slow zoom out revealing the scene",
-    "gentle handheld camera drift, cinematic",
-    "slow dolly forward, ethereal glow",
-    "camera slowly rotates, atmospheric haze",
-    "subtle zoom in, particles floating",
-    "gentle camera float upward, cinematic light",
-    "slow pan right, soft depth of field",
+# Alternating zoom-in / zoom-out Ken Burns effect — no API calls, no downloads
+_ZOOMPAN_Z = [
+    "min(zoom+0.0008,1.12)",                                   # zoom in
+    "if(lte(zoom,1.0),1.10,max(1.0,zoom-0.0008))",            # zoom out
 ]
 
 
-KLING_CONCURRENCY = 5  # trial pack limit
-
-
 def animate_images(image_paths: list[Path], slug: str) -> list[Path]:
-    print(f"[4/5] Animating {len(image_paths)} images with Kling...")
+    print(f"[4/5] Animating {len(image_paths)} images with FFmpeg zoompan...")
     clip_dir = OUTPUT_DIR / f"{slug}_clips"
     clip_dir.mkdir(exist_ok=True)
 
     video_paths = []
-    for batch_start in range(0, len(image_paths), KLING_CONCURRENCY):
-        batch = image_paths[batch_start: batch_start + KLING_CONCURRENCY]
-        batch_indices = list(range(batch_start, batch_start + len(batch)))
+    for i, img_path in enumerate(image_paths):
+        z_expr = _ZOOMPAN_Z[i % len(_ZOOMPAN_Z)]
+        clip_path = clip_dir / f"clip_{i:02d}.mp4"
 
-        task_ids = []
-        for i, img_path in zip(batch_indices, batch):
-            motion = MOTION_PROMPTS[i % len(MOTION_PROMPTS)]
-            print(f"   Submitting clip {i+1}/{len(image_paths)}...")
-            task_id = _kling_submit(img_path, motion)
-            task_ids.append((i, task_id))
-            time.sleep(1)
+        # Scale to 1440x1920 (same 3:4 AR as FAL output), then zoompan crops to 1080x1920
+        vf = (
+            f"scale=1440:1920:force_original_aspect_ratio=decrease,"
+            f"pad=1440:1920:(ow-iw)/2:(oh-ih)/2:black,"
+            f"zoompan=z='{z_expr}':x='(iw-iw/zoom)/2':y='(ih-ih/zoom)/2'"
+            f":d=125:s={VIDEO_W}x{VIDEO_H}:fps=25"
+        )
 
-        for i, task_id in task_ids:
-            print(f"   Waiting for clip {i+1}/{len(image_paths)} (task {task_id})...")
-            video_url = _kling_poll(task_id)
-            clip_path = clip_dir / f"clip_{i:02d}.mp4"
-            r = requests.get(video_url, timeout=120)
-            r.raise_for_status()
-            clip_path.write_bytes(r.content)
-            print(f"   ✓ Clip {i+1} saved ({len(r.content)//1024}KB)")
-            video_paths.append(clip_path)
+        result = subprocess.run(
+            [FFMPEG_EXE, "-y",
+             "-loop", "1",
+             "-i", str(img_path),
+             "-vf", vf,
+             "-frames:v", "125",
+             "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+             "-pix_fmt", "yuv420p",
+             str(clip_path)],
+            check=False,
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"FFmpeg zoompan failed for clip {i+1}: "
+                + result.stderr.decode(errors="replace")[-400:]
+            )
+        print(f"   ✓ Clip {i+1}/{len(image_paths)} animated")
+        video_paths.append(clip_path)
 
     return video_paths
 

@@ -1,16 +1,17 @@
 """
 Flask API wrapper around the TikTok video pipeline.
 POST /generate          { "topic": "..." }               → { "job_id": "..." }
-GET  /status/:id                                         → { "status": "...", "video_b64": "...", "caption": "..." }
+GET  /status/:id                                         → { "status": "...", "caption": "..." }
+GET  /download/:id                                       → video/mp4 stream
 POST /post              { "job_id": "...", "title": "..." } → { "ok": true, "publish_id": "..." }
 GET  /oauth/start                                       → redirect to TikTok OAuth
 GET  /oauth/callback                                    → exchange code, store tokens
 GET  /oauth/status                                      → { "authorized": true/false }
 """
 
-import os, uuid, threading, base64, json
+import os, uuid, threading, json
 from pathlib import Path
-from flask import Flask, request, jsonify, redirect
+from flask import Flask, request, jsonify, redirect, send_file
 from flask_cors import CORS
 from dotenv import load_dotenv
 import requests as http_requests
@@ -26,7 +27,7 @@ from pipeline import generate_video, generate_script, generate_images, generate_
 app = Flask(__name__)
 CORS(app)
 
-jobs: dict = {}   # job_id → { status, video_b64, caption, error }
+jobs: dict = {}   # job_id → { status, video_path, caption, error }
 
 TIKTOK_CLIENT_KEY    = os.environ.get("TIKTOK_CLIENT_KEY", "")
 TIKTOK_CLIENT_SECRET = os.environ.get("TIKTOK_CLIENT_SECRET", "")
@@ -73,13 +74,15 @@ def _run_job(job_id: str, topic: str):
         jobs[job_id]["step"] = "assembly"
         video_path = assemble_video(clip_paths, audio_path, word_boundaries, script_data, slug)
 
-        with open(video_path, "rb") as f:
-            jobs[job_id]["video_b64"] = base64.b64encode(f.read()).decode()
+        # Store path on disk — never load the video into RAM
+        jobs[job_id]["video_path"] = str(video_path)
 
         # Cleanup intermediates
         for p in image_paths:
             p.unlink(missing_ok=True)
         audio_path.unlink(missing_ok=True)
+        for cp in clip_paths:
+            cp.unlink(missing_ok=True)
 
         jobs[job_id]["status"] = "done"
         jobs[job_id]["step"] = "done"
@@ -99,7 +102,7 @@ def generate():
         return jsonify({"error": "topic required"}), 400
 
     job_id = str(uuid.uuid4())
-    jobs[job_id] = {"status": "pending", "video_b64": None, "caption": None, "error": None}
+    jobs[job_id] = {"status": "pending", "video_path": None, "caption": None, "error": None}
 
     thread = threading.Thread(target=_run_job, args=(job_id, topic), daemon=True)
     thread.start()
@@ -112,7 +115,19 @@ def status(job_id: str):
     job = jobs.get(job_id)
     if not job:
         return jsonify({"status": "not_found"}), 404
-    return jsonify(job)
+    # Exclude internal video_path from polling response
+    return jsonify({k: v for k, v in job.items() if k != "video_path"})
+
+
+@app.route("/download/<job_id>")
+def download(job_id: str):
+    job = jobs.get(job_id)
+    if not job or job["status"] != "done":
+        return jsonify({"error": "not ready"}), 404
+    video_path = job.get("video_path")
+    if not video_path or not os.path.exists(video_path):
+        return jsonify({"error": "video file not found"}), 404
+    return send_file(video_path, mimetype="video/mp4", as_attachment=False)
 
 
 # ─── TikTok OAuth ──────────────────────────────────────────────────────────────
@@ -177,9 +192,14 @@ def post_to_tiktok():
     if not tokens:
         return jsonify({"error": "not_authorized", "auth_url": f"{RENDER_URL}/oauth/start"}), 401
 
+    video_path = job.get("video_path")
+    if not video_path or not os.path.exists(video_path):
+        return jsonify({"error": "Video file not found on server"}), 500
+
     access_token = tokens["access_token"]
-    video_bytes  = base64.b64decode(job["video_b64"])
-    video_size   = len(video_bytes)
+    with open(video_path, "rb") as f:
+        video_bytes = f.read()
+    video_size = len(video_bytes)
 
     # Init upload
     init_resp = http_requests.post(
