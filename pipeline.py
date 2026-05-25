@@ -261,31 +261,36 @@ def _kling_jwt() -> str:
 
 def _kling_submit(image_path: Path, motion_prompt: str) -> str:
     """Submit image-to-video task. Sends image as base64 to avoid CDN restrictions."""
-    token = _kling_jwt()
     img_b64 = base64.b64encode(image_path.read_bytes()).decode()
-    resp = requests.post(
-        "https://api.klingai.com/v1/videos/image2video",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model_name": "kling-v1",
-            "image": img_b64,
-            "prompt": motion_prompt,
-            "duration": "5",
-            "mode": "std",
-            "aspect_ratio": "9:16",
-        },
-        timeout=30,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    if data.get("code") != 0:
-        raise RuntimeError(f"Kling submit failed: {data}")
-    task_id = data["data"]["task_id"]
-    print(f"   Submitted task {task_id}")
-    return task_id
+    payload = {
+        "model_name": "kling-v1",
+        "image": img_b64,
+        "prompt": motion_prompt,
+        "duration": "5",
+        "mode": "std",
+        "aspect_ratio": "9:16",
+    }
+    for attempt, wait in enumerate([0, 30, 60, 120]):
+        if wait:
+            print(f"   Kling 429 — waiting {wait}s before retry {attempt}...")
+            time.sleep(wait)
+        token = _kling_jwt()
+        resp = requests.post(
+            "https://api.klingai.com/v1/videos/image2video",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=30,
+        )
+        if resp.status_code == 429:
+            continue
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("code") != 0:
+            raise RuntimeError(f"Kling submit failed: {data}")
+        task_id = data["data"]["task_id"]
+        print(f"   Submitted task {task_id}")
+        return task_id
+    raise RuntimeError("Kling submit failed after 4 attempts (persistent 429)")
 
 
 def _kling_poll(task_id: str, timeout: int = 300) -> str:
@@ -326,7 +331,7 @@ MOTION_PROMPTS = [
 ]
 
 
-KLING_CONCURRENCY = 5  # trial pack limit
+KLING_CONCURRENCY = 3  # 3 concurrent to avoid 429 rate limits
 
 
 def animate_images(image_paths: list[Path], slug: str) -> list[Path]:
