@@ -317,21 +317,27 @@ def suggest_topics():
         except Exception:
             pass
 
-    if not raw_titles:
-        # Fallback: return hardcoded seed topics if scraping fails
-        return jsonify({"topics": [
-            "the mantis shrimp can see 16 colours humans can only see 3",
-            "your body replaces most of its cells every few years",
-            "honey found in ancient Egyptian tombs is still edible",
-            "the human eye has a blind spot your brain hides from you",
-            "tardigrades can survive in the vacuum of space",
-            "cleopatra lived closer in time to the moon landing than to the pyramids",
-            "a day on venus is longer than a year on venus",
-            "the loudest animal on earth is smaller than your thumb",
-        ]})
+    import time as _time
+    seed = int(_time.time())  # ensures different results every call
 
-    sample = "\n".join(raw_titles[:30])
-    prompt = f"""You are a TikTok science content strategist. Below are recent video titles and captions from successful science facts channels.
+    if not raw_titles:
+        # yt-dlp scraping blocked on this server IP — ask Claude directly
+        prompt = f"""You are a TikTok science content strategist for @provenweird — a dry, sardonic science facts channel.
+
+Generate 8 ORIGINAL, varied topic ideas that would make great 60-second science/facts videos. Each should be a single punchy phrase (10-20 words max) with a built-in paradox, counterintuitive fact, or philosophical angle.
+
+Focus on: biology, physics, psychology, space, ocean, human body, animal facts, historical paradoxes.
+
+Rules:
+- NEVER reuse topics from previous suggestions
+- Vary the angle: use paradoxes, myth-busts, existential hooks, stakes-first openings
+- No "Did you know" framing
+- Seed for variety: {seed}
+
+Return ONLY a JSON array of 8 strings. No markdown. No explanation."""
+    else:
+        sample = "\n".join(raw_titles[:30])
+        prompt = f"""You are a TikTok science content strategist. Below are older video titles from successful science facts channels (scraped from positions 31-55 in their feed — proven topics, no overlap risk).
 
 Study the topics, angles, and hooks. Then generate 8 ORIGINAL topic ideas inspired by this style — NOT copies, but new topics using the same energy and angles. Each should be a single punchy topic phrase (10-20 words max) that would work as a @provenweird video.
 
@@ -339,6 +345,8 @@ Focus on: biology, physics, psychology, space, ocean, human body, animal facts, 
 
 Source content:
 {sample}
+
+Seed for variety: {seed}
 
 Return ONLY a JSON array of 8 strings. No markdown. No explanation."""
 
@@ -362,7 +370,7 @@ Return ONLY a JSON array of 8 strings. No markdown. No explanation."""
         raw = raw.split("```")[1].lstrip("json").strip()
         raw = raw.rsplit("```", 1)[0].strip()
     topics = json.loads(raw)
-    return jsonify({"topics": topics, "source_count": len(raw_titles)})
+    return jsonify({"topics": topics, "source_count": len(raw_titles), "source": "scraped" if raw_titles else "claude"})
 
 
 # ─── health ────────────────────────────────────────────────────────────────────
