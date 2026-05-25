@@ -282,6 +282,9 @@ def _kling_submit(image_path: Path, motion_prompt: str) -> str:
             timeout=30,
         )
         if resp.status_code == 429:
+            body = resp.json() if resp.content else {}
+            if body.get("code") == 1102:
+                raise RuntimeError("Kling account balance is empty — top up credits at klingai.com")
             continue
         resp.raise_for_status()
         data = resp.json()
@@ -290,7 +293,7 @@ def _kling_submit(image_path: Path, motion_prompt: str) -> str:
         task_id = data["data"]["task_id"]
         print(f"   Submitted task {task_id}")
         return task_id
-    raise RuntimeError("Kling submit failed after 4 attempts (persistent 429)")
+    raise RuntimeError("Kling submit failed after 4 attempts (persistent 429 rate limit)")
 
 
 def _kling_poll(task_id: str, timeout: int = 300) -> str:
