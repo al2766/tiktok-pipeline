@@ -22,7 +22,6 @@ import imageio_ffmpeg
 os.environ["FFMPEG_BINARY"] = imageio_ffmpeg.get_ffmpeg_exe()
 
 from pipeline import generate_video, generate_script, generate_images, generate_tts, animate_images, assemble_video
-from reel_analyzer import analyze_reel
 
 app = Flask(__name__)
 CORS(app)
@@ -238,6 +237,7 @@ analyze_jobs: dict = {}   # job_id → { status, result, error }
 def _run_analyze(job_id: str, url: str, frames: bool):
     analyze_jobs[job_id]["status"] = "analyzing"
     try:
+        from reel_analyzer import analyze_reel
         result = analyze_reel(url, extract_frames=frames)
         analyze_jobs[job_id]["status"] = "done"
         analyze_jobs[job_id]["result"] = result

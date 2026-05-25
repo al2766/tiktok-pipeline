@@ -8,3 +8,5 @@ numpy
 pillow
 requests
 yt-dlp
+PyJWT
+fal-client
