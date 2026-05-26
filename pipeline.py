@@ -5,11 +5,13 @@ Output: single MP4 in ./output/ — no intermediates kept
 Steps:  1. Claude (cached system prompt) → 12-sentence script + visual prompts
         2. ElevenLabs → voice MP3 + word timestamps
         3. FAL FLUX → 12 × 9:16 images
-        4. FFmpeg → Ken Burns per image → concat → stretch → captions → mux audio
-        5. Google Drive upload (optional — requires GDRIVE_SERVICE_ACCOUNT_JSON + GDRIVE_FOLDER_ID env vars)
+        4. Kling AI (direct API, JWT auth) → animate each image into 5s clip
+        5. FFmpeg → concat clips → stretch → karaoke captions → mux audio
+        6. Google Drive upload (optional)
 """
 
 import os, json, re, time, subprocess, base64, requests, asyncio, shutil
+import jwt  # PyJWT
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -17,7 +19,10 @@ load_dotenv()
 
 ANTHROPIC_API_KEY  = os.environ["ANTHROPIC_API_KEY"]
 ELEVENLABS_API_KEY = os.environ["ELEVENLABS_API_KEY"]
+KLING_ACCESS_KEY   = os.environ["KLING_ACCESS_KEY"]
+KLING_SECRET_KEY   = os.environ["KLING_SECRET_KEY"]
 FAL_KEY            = os.environ["FAL_KEY"]
+
 
 def _ffmpeg() -> str:
     import shutil as _shutil
@@ -27,14 +32,14 @@ def _ffmpeg() -> str:
     import imageio_ffmpeg
     return imageio_ffmpeg.get_ffmpeg_exe()
 
+
 FFMPEG     = _ffmpeg()
 OUTPUT_DIR = Path(__file__).parent / "output"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-VIDEO_W, VIDEO_H      = 1080, 1920
-ELEVENLABS_VOICE_ID   = "nPczCjzI2devNBz1zQrb"  # Brian — deep, natural
+VIDEO_W, VIDEO_H    = 1080, 1920
+ELEVENLABS_VOICE_ID = "nPczCjzI2devNBz1zQrb"  # Brian — deep, natural
 
-# Cached once per worker — saves ~600 tokens on every script call
 _SCRIPT_SYSTEM = """You write scripts for @provenweird — a faceless science facts TikTok built to stop scrolling cold.
 
 VOICE: Dry, slightly sarcastic, mysteriously confident. You know something the viewer doesn't — and you find their ignorance mildly amusing, but you're on their side. You're the cool scientist at the back of the bar who just told you something that ruins how you see the world forever. Deliver facts like they're slightly scandalous secrets someone forgot to classify. Never excited. Never teacher-ish. The sarcasm is aimed at the universe ("of course it works like that") — never at the viewer.
@@ -78,7 +83,7 @@ Return ONLY valid JSON, no markdown, no backticks:
 # ─── Step 1: Script ───────────────────────────────────────────────────────────
 
 def generate_script(topic: str) -> dict:
-    print(f"[1/4] Generating script: {topic}")
+    print(f"[1/5] Generating script: {topic}")
     for attempt in range(3):
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
@@ -98,7 +103,6 @@ def generate_script(topic: str) -> dict:
         )
         resp.raise_for_status()
         raw = resp.json()["content"][0]["text"].strip()
-        # Strip markdown fences if Claude adds them
         if raw.startswith("```"):
             raw = raw.split("```")[1]
             if raw.startswith("json"):
@@ -117,7 +121,7 @@ def generate_script(topic: str) -> dict:
 # ─── Step 2: TTS + word timestamps ───────────────────────────────────────────
 
 def generate_tts(script: str, slug: str) -> tuple[Path, list[dict]]:
-    print("[2/4] Generating voice...")
+    print("[2/5] Generating voice...")
     audio_path = OUTPUT_DIR / f"{slug}_audio.mp3"
 
     resp = requests.post(
@@ -190,12 +194,12 @@ def _whisper_timestamps(audio_path: Path) -> list[dict]:
 
 # ─── Step 3: Images via FAL FLUX ─────────────────────────────────────────────
 
-def generate_images(visual_prompts: list[str], slug: str) -> tuple[list[Path], list[str]]:
-    """Returns (local_paths, fal_cdn_urls) — URLs are passed to AI animation step."""
+def generate_images(visual_prompts: list[str], slug: str) -> list[Path]:
+    """Generate images via FAL FLUX. Returns local paths (Kling receives base64, not URLs)."""
     print(f"[3/5] Generating {len(visual_prompts)} images...")
     img_dir = OUTPUT_DIR / f"{slug}_img"
     img_dir.mkdir(exist_ok=True)
-    paths, urls = [], []
+    paths = []
     for i, prompt in enumerate(visual_prompts):
         resp = requests.post(
             "https://fal.run/fal-ai/flux/schnell",
@@ -210,90 +214,134 @@ def generate_images(visual_prompts: list[str], slug: str) -> tuple[list[Path], l
             timeout=90,
         )
         resp.raise_for_status()
-        url = resp.json()["images"][0]["url"]
+        url      = resp.json()["images"][0]["url"]
         img_path = img_dir / f"{i:02d}.jpg"
         img_path.write_bytes(requests.get(url, timeout=60).content)
         print(f"   {i+1}/{len(visual_prompts)} ✓")
         paths.append(img_path)
-        urls.append(url)
-    return paths, urls
+    return paths
 
 
-# ─── Step 4: AI animation via MiniMax (FAL queue) ─────────────────────────────
+# ─── Step 4: Kling image-to-video (direct API, JWT auth) ─────────────────────
 
-_MOTION_STYLES = [
-    "slow cinematic zoom in, dramatic atmosphere, smooth motion",
-    "gentle camera drift left, ethereal lighting, fluid",
-    "slow pull back revealing scale, epic atmosphere",
-    "subtle camera movement upward, intense and cinematic",
-    "slow zoom out, atmospheric depth, dramatic reveal",
-    "gentle rightward pan, vivid and dynamic, cinematic",
+def _kling_jwt() -> str:
+    payload = {
+        "iss": KLING_ACCESS_KEY,
+        "exp": int(time.time()) + 1800,
+        "nbf": int(time.time()) - 5,
+    }
+    return jwt.encode(payload, KLING_SECRET_KEY, algorithm="HS256",
+                      headers={"alg": "HS256", "typ": "JWT"})
+
+
+def _kling_submit(image_path: Path, motion_prompt: str) -> str:
+    """Submit one image-to-video task via base64. Returns task_id."""
+    img_b64 = base64.b64encode(image_path.read_bytes()).decode()
+    payload = {
+        "model_name": "kling-v1",
+        "image":      img_b64,
+        "prompt":     motion_prompt,
+        "duration":   "5",
+        "mode":       "std",
+        "aspect_ratio": "9:16",
+    }
+    for attempt, wait in enumerate([0, 30, 60, 120]):
+        if wait:
+            print(f"   Kling 429 — waiting {wait}s before retry {attempt}...")
+            time.sleep(wait)
+        token = _kling_jwt()
+        resp  = requests.post(
+            "https://api.klingai.com/v1/videos/image2video",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=30,
+        )
+        if resp.status_code == 429:
+            body = resp.json() if resp.content else {}
+            if body.get("code") == 1102:
+                raise RuntimeError("Kling account balance is empty — top up credits at klingai.com")
+            continue
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("code") != 0:
+            raise RuntimeError(f"Kling submit failed: {data}")
+        task_id = data["data"]["task_id"]
+        print(f"   Submitted task {task_id}")
+        return task_id
+    raise RuntimeError("Kling submit failed after 4 attempts (persistent 429)")
+
+
+def _kling_poll(task_id: str, timeout: int = 300) -> str:
+    """Poll until task is done. Returns video URL."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(10)
+        token = _kling_jwt()
+        resp  = requests.get(
+            f"https://api.klingai.com/v1/videos/image2video/{task_id}",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data   = resp.json()
+        if data.get("code") != 0:
+            raise RuntimeError(f"Kling poll error: {data}")
+        task   = data["data"]
+        status = task.get("task_status", "")
+        if status == "succeed":
+            return task["task_result"]["videos"][0]["url"]
+        if status == "failed":
+            raise RuntimeError(f"Kling task failed: {task.get('task_status_msg')}")
+        print(f"   Kling {task_id}: {status}...")
+    raise RuntimeError(f"Kling task {task_id} timed out after {timeout}s")
+
+
+_MOTION_PROMPTS = [
+    "slow cinematic zoom in, gentle camera drift",
+    "slow pull back, soft ambient motion",
+    "subtle camera pan left, dreamy atmosphere",
+    "slow zoom out revealing the scene",
+    "gentle handheld camera drift, cinematic",
+    "slow dolly forward, ethereal glow",
+    "camera slowly rotates, atmospheric haze",
+    "subtle zoom in, particles floating",
+    "gentle camera float upward, cinematic light",
+    "slow pan right, soft depth of field",
 ]
 
-_FAL_QUEUE   = "https://queue.fal.run"
-_KLING_MODEL = "fal-ai/kling-video/v1.6/standard/image-to-video"
+KLING_CONCURRENCY = 3
 
 
-def animate_images_ai(image_urls: list[str], slug: str) -> list[Path]:
-    """Submit all images to Kling simultaneously via FAL queue. Falls back to Ken Burns on error."""
-    print(f"[4/5] Animating {len(image_urls)} images with Kling AI (parallel)...")
-    tmp = OUTPUT_DIR / f"{slug}_tmp"
-    tmp.mkdir(exist_ok=True)
+def animate_images(image_paths: list[Path], slug: str) -> list[Path]:
+    """Animate images with Kling (direct API). 3 concurrent, 300s per-clip timeout."""
+    print(f"[4/5] Animating {len(image_paths)} images with Kling...")
+    clip_dir = OUTPUT_DIR / f"{slug}_clips"
+    clip_dir.mkdir(exist_ok=True)
 
-    headers = {"Authorization": f"Key {FAL_KEY}", "Content-Type": "application/json"}
+    video_paths = []
+    for batch_start in range(0, len(image_paths), KLING_CONCURRENCY):
+        batch         = image_paths[batch_start: batch_start + KLING_CONCURRENCY]
+        batch_indices = list(range(batch_start, batch_start + len(batch)))
 
-    # Submit all requests at once
-    request_ids: list[str] = []
-    for i, img_url in enumerate(image_urls):
-        motion = _MOTION_STYLES[i % len(_MOTION_STYLES)]
-        try:
-            r = requests.post(
-                f"{_FAL_QUEUE}/{_KLING_MODEL}",
-                headers=headers,
-                json={"image_url": img_url, "prompt": motion, "duration": "5"},
-                timeout=30,
-            )
+        task_ids = []
+        for i, img_path in zip(batch_indices, batch):
+            motion  = _MOTION_PROMPTS[i % len(_MOTION_PROMPTS)]
+            print(f"   Submitting clip {i+1}/{len(image_paths)}...")
+            task_id = _kling_submit(img_path, motion)
+            task_ids.append((i, task_id))
+            time.sleep(1)
+
+        for i, task_id in task_ids:
+            print(f"   Waiting for clip {i+1}/{len(image_paths)} (task {task_id})...")
+            video_url  = _kling_poll(task_id)
+            clip_path  = clip_dir / f"clip_{i:02d}.mp4"
+            r = requests.get(video_url, timeout=120)
             r.raise_for_status()
-            request_ids.append(r.json()["request_id"])
-            print(f"   Queued {i+1}/{len(image_urls)}")
-        except Exception as e:
-            raise RuntimeError(f"Kling submit failed for clip {i+1}: {e}")
+            clip_path.write_bytes(r.content)
+            print(f"   ✓ Clip {i+1} saved ({len(r.content)//1024}KB)")
+            video_paths.append(clip_path)
 
-    # Poll all in parallel until every clip is done
-    clips: list[Path | None] = [None] * len(request_ids)
-    pending   = set(range(len(request_ids)))
-    deadline  = time.time() + 600  # 10-minute hard timeout
-
-    while pending:
-        if time.time() > deadline:
-            raise RuntimeError("Kling animation timed out after 10 minutes")
-        time.sleep(10)
-        for i in list(pending):
-            try:
-                st = requests.get(
-                    f"{_FAL_QUEUE}/{_KLING_MODEL}/requests/{request_ids[i]}/status",
-                    headers=headers, timeout=15,
-                ).json()
-                status = st.get("status", "")
-                if status == "COMPLETED":
-                    result = requests.get(
-                        f"{_FAL_QUEUE}/{_KLING_MODEL}/requests/{request_ids[i]}",
-                        headers=headers, timeout=15,
-                    ).json()
-                    video_url = result["video"]["url"]
-                    clip_path = tmp / f"c{i:02d}.mp4"
-                    clip_path.write_bytes(requests.get(video_url, timeout=120).content)
-                    clips[i] = clip_path
-                    pending.discard(i)
-                    print(f"   ✓ Clip {i+1}/{len(request_ids)}")
-                elif status == "FAILED":
-                    raise RuntimeError(f"Kling clip {i+1} failed: {st.get('error', '')}")
-            except RuntimeError:
-                raise
-            except Exception:
-                pass  # transient network error — retry next poll cycle
-
-    return [c for c in clips if c is not None]  # type: ignore[misc]
+    return video_paths
 
 
 # ─── Step 5: Assemble ─────────────────────────────────────────────────────────
@@ -322,7 +370,7 @@ def _ass_time(t: float) -> str:
 
 
 def _kenburns_clips(image_paths: list[Path], tmp: Path) -> list[Path]:
-    """Ken Burns zoompan fallback — used when AI animation is unavailable."""
+    """Ken Burns zoompan fallback — used when Kling is unavailable."""
     clip_paths = []
     for i, img in enumerate(image_paths):
         z    = _ZOOMPAN[i % 2]
@@ -355,9 +403,9 @@ def assemble_clips(
     slug: str,
     cleanup_images: list[Path] | None = None,
 ) -> Path:
-    """Concat AI/Ken-Burns clips + mux audio + burn karaoke captions → final MP4."""
+    """Concat clips + mux audio + burn karaoke captions → final MP4."""
     print("[5/5] Assembling final video...")
-    tmp     = clip_paths[0].parent  # clips are already in tmp dir
+    tmp      = clip_paths[0].parent
     out_path = OUTPUT_DIR / f"{slug}.mp4"
 
     concat_list = tmp / "clips.txt"
@@ -441,7 +489,6 @@ def assemble_clips(
         check=True, capture_output=True,
     )
 
-    # Clean up tmp dir, images, audio
     shutil.rmtree(tmp, ignore_errors=True)
     if cleanup_images:
         img_dir = cleanup_images[0].parent if cleanup_images else None
@@ -456,7 +503,7 @@ def assemble_clips(
 
 
 def assemble_video(image_paths: list[Path], audio_path: Path, boundaries: list[dict], slug: str) -> Path:
-    """Ken Burns fallback path — used when AI animation is skipped."""
+    """Ken Burns fallback path."""
     tmp = OUTPUT_DIR / f"{slug}_tmp"
     tmp.mkdir(exist_ok=True)
     clip_paths = _kenburns_clips(image_paths, tmp)
@@ -486,11 +533,10 @@ def upload_to_drive(video_path: Path) -> str | None:
         media     = MediaFileUpload(str(video_path), mimetype="video/mp4", resumable=True)
         f         = service.files().create(body=file_meta, media_body=media, fields="id,webViewLink").execute()
 
-        # Make viewable by anyone with the link
         service.permissions().create(fileId=f["id"], body={"type": "anyone", "role": "reader"}).execute()
 
         url = f.get("webViewLink")
-        print(f"   ☁️  Drive: {url}")
+        print(f"   Drive: {url}")
         return url
     except Exception as e:
         print(f"   Drive upload failed (non-fatal): {e}")
@@ -500,16 +546,14 @@ def upload_to_drive(video_path: Path) -> str | None:
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def generate_video(topic: str) -> tuple[Path, str]:
-    slug              = re.sub(r"[^a-z0-9]+", "_", topic.lower())[:40] + f"_{int(time.time())}"
-    script            = generate_script(topic)
-    audio, wds        = generate_tts(script["script"], slug)
-    image_paths, urls = generate_images(script["visual_prompts"], slug)
-    tmp               = OUTPUT_DIR / f"{slug}_tmp"
-    tmp.mkdir(exist_ok=True)
-    clip_paths        = animate_images_ai(urls, slug)
-    video             = assemble_clips(clip_paths, audio, wds, slug, cleanup_images=image_paths)
-    caption           = script.get("tiktok_caption", "")
-    print(f"\n📋 Caption: {caption}")
+    slug        = re.sub(r"[^a-z0-9]+", "_", topic.lower())[:40] + f"_{int(time.time())}"
+    script      = generate_script(topic)
+    audio, wds  = generate_tts(script["script"], slug)
+    image_paths = generate_images(script["visual_prompts"], slug)
+    clip_paths  = animate_images(image_paths, slug)
+    video       = assemble_clips(clip_paths, audio, wds, slug, cleanup_images=image_paths)
+    caption     = script.get("tiktok_caption", "")
+    print(f"\nCaption: {caption}")
     return video, caption
 
 

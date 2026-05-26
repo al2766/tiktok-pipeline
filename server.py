@@ -24,7 +24,7 @@ load_dotenv()
 import imageio_ffmpeg
 os.environ["FFMPEG_BINARY"] = imageio_ffmpeg.get_ffmpeg_exe()
 
-from pipeline import generate_script, generate_tts, generate_images, animate_images_ai, assemble_clips, upload_to_drive
+from pipeline import generate_script, generate_tts, generate_images, animate_images, assemble_clips, upload_to_drive
 
 app  = Flask(__name__)
 CORS(app)
@@ -66,10 +66,10 @@ def _run_job(job_id: str, topic: str):
         audio_path, word_boundaries = generate_tts(script_data["script"], slug)
 
         jobs[job_id]["step"] = "images"
-        image_paths, image_urls = generate_images(script_data["visual_prompts"], slug)
+        image_paths = generate_images(script_data["visual_prompts"], slug)
 
         jobs[job_id]["step"] = "animation"
-        clip_paths = animate_images_ai(image_urls, slug)
+        clip_paths = animate_images(image_paths, slug)
 
         jobs[job_id]["step"] = "assembly"
         video_path = assemble_clips(clip_paths, audio_path, word_boundaries, slug, cleanup_images=image_paths)
