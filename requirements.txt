@@ -6,4 +6,3 @@ imageio[ffmpeg]
 imageio-ffmpeg
 requests
 playwright
-faster-whisper
