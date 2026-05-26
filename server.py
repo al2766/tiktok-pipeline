@@ -24,7 +24,7 @@ load_dotenv()
 import imageio_ffmpeg
 os.environ["FFMPEG_BINARY"] = imageio_ffmpeg.get_ffmpeg_exe()
 
-from pipeline import generate_script, generate_tts, generate_images, assemble_video
+from pipeline import generate_script, generate_tts, generate_images, assemble_video, upload_to_drive
 
 app  = Flask(__name__)
 CORS(app)
@@ -72,6 +72,10 @@ def _run_job(job_id: str, topic: str):
         video_path = assemble_video(image_paths, audio_path, word_boundaries, slug)
 
         jobs[job_id]["video_path"] = str(video_path)
+
+        jobs[job_id]["step"] = "uploading"
+        jobs[job_id]["drive_url"] = upload_to_drive(video_path)
+
         jobs[job_id]["status"] = "done"
         jobs[job_id]["step"]   = "done"
 
@@ -91,7 +95,7 @@ def generate():
         return jsonify({"error": "topic required"}), 400
 
     job_id = str(uuid.uuid4())
-    jobs[job_id] = {"status": "pending", "step": "", "video_path": None, "caption": None, "error": None}
+    jobs[job_id] = {"status": "pending", "step": "", "video_path": None, "caption": None, "drive_url": None, "error": None}
     threading.Thread(target=_run_job, args=(job_id, topic), daemon=True).start()
     return jsonify({"job_id": job_id})
 

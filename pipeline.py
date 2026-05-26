@@ -6,6 +6,7 @@ Steps:  1. Claude (cached system prompt) → 12-sentence script + visual prompts
         2. ElevenLabs → voice MP3 + word timestamps
         3. FAL FLUX → 12 × 9:16 images
         4. FFmpeg → Ken Burns per image → concat → stretch → captions → mux audio
+        5. Google Drive upload (optional — requires GDRIVE_SERVICE_ACCOUNT_JSON + GDRIVE_FOLDER_ID env vars)
 """
 
 import os, json, re, time, subprocess, base64, requests, asyncio, shutil
@@ -349,6 +350,40 @@ def assemble_video(image_paths: list[Path], audio_path: Path, boundaries: list[d
 
     print(f"✅ {out_path.name}")
     return out_path
+
+
+# ─── Google Drive upload (optional) ──────────────────────────────────────────
+
+def upload_to_drive(video_path: Path) -> str | None:
+    """Upload video to Google Drive. Returns shareable view URL, or None if not configured."""
+    creds_json = os.environ.get("GDRIVE_SERVICE_ACCOUNT_JSON")
+    folder_id  = os.environ.get("GDRIVE_FOLDER_ID")
+    if not creds_json or not folder_id:
+        return None
+    try:
+        from google.oauth2.service_account import Credentials
+        from googleapiclient.discovery import build
+        from googleapiclient.http import MediaFileUpload
+
+        creds   = Credentials.from_service_account_info(
+            json.loads(creds_json),
+            scopes=["https://www.googleapis.com/auth/drive.file"],
+        )
+        service = build("drive", "v3", credentials=creds, cache_discovery=False)
+
+        file_meta = {"name": video_path.name, "parents": [folder_id]}
+        media     = MediaFileUpload(str(video_path), mimetype="video/mp4", resumable=True)
+        f         = service.files().create(body=file_meta, media_body=media, fields="id,webViewLink").execute()
+
+        # Make viewable by anyone with the link
+        service.permissions().create(fileId=f["id"], body={"type": "anyone", "role": "reader"}).execute()
+
+        url = f.get("webViewLink")
+        print(f"   ☁️  Drive: {url}")
+        return url
+    except Exception as e:
+        print(f"   Drive upload failed (non-fatal): {e}")
+        return None
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────

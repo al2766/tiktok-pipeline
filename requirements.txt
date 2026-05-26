@@ -6,3 +6,5 @@ imageio[ffmpeg]
 imageio-ffmpeg
 requests
 playwright
+google-api-python-client
+google-auth
