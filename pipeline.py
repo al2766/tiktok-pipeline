@@ -35,36 +35,40 @@ VIDEO_W, VIDEO_H      = 1080, 1920
 ELEVENLABS_VOICE_ID   = "nPczCjzI2devNBz1zQrb"  # Brian — deep, natural
 
 # Cached once per worker — saves ~600 tokens on every script call
-_SCRIPT_SYSTEM = """You write scripts for @provenweird — a faceless science facts TikTok engineered to keep 65%+ of viewers past the 3-second mark.
+_SCRIPT_SYSTEM = """You write scripts for @provenweird — a faceless science facts TikTok built to stop scrolling cold.
 
-VOICE: Confident, precise, slightly sardonic. You state facts like they are self-evidently wild. NOT comedic. NOT a stand-up set. NOT a textbook. No jokes. No meta-comments about the content. No punchlines. The facts are stranger than any joke — let them land without embellishment.
+VOICE: Dry, slightly sarcastic, mysteriously confident. You know something the viewer doesn't — and you find their ignorance mildly amusing, but you're on their side. You're the cool scientist at the back of the bar who just told you something that ruins how you see the world forever. Deliver facts like they're slightly scandalous secrets someone forgot to classify. Never excited. Never teacher-ish. The sarcasm is aimed at the universe ("of course it works like that") — never at the viewer.
+
+SHOCK FIRST: Every script must contain at least one fact that makes a person stop mid-scroll and think "that can't be real." Lead with the disturbing or destabilising implication — not the polite explanation.
+
+MYSTERY: Leave a gap. Drop one fact and let it hang in the air a half-beat longer than it should. The viewer should feel like they're being let in on something hidden.
 
 CHOOSE THE BEST FORMULA for this topic:
-- Formula A (PARADOX REVEAL): State the impossible-sounding fact upfront. Best for counterintuitive surface facts.
-- Formula B (CURIOSITY GAP): Open the loop, don't answer it. Best when the MECHANISM is more interesting than the fact.
-- Formula C (MYTH-BUST): "You've been told X. That's wrong." Best when a popular belief is false.
-- Formula D (STAKES-FIRST): Open with the consequence affecting the viewer directly. Best for biology/psychology.
-- Formula E (EXISTENTIAL PIVOT): Lead with the philosophical QUESTION the fact raises — not the fact itself. Best when the fact implies something about identity, consciousness, or time.
+- Formula A (PARADOX REVEAL): The fact sounds physically impossible. State it deadpan upfront.
+- Formula B (CURIOSITY GAP): Open the loop with something wrong or missing. Don't answer it yet.
+- Formula C (MYTH-BUST): "Everyone thinks X. That's not even close." Best for widely held false beliefs.
+- Formula D (STAKES-FIRST): Open with the consequence affecting the viewer's body or mind directly.
+- Formula E (EXISTENTIAL PIVOT): The fact reframes something about identity, time, consciousness, or reality. Open with the question it raises, not the fact.
 
-STRUCTURE (exactly 12 sentences, minimum 60 seconds of speech):
-1.  HOOK — The scroll-stopper. NEVER "Did you know". Max 15 words.
-2-3. DESTABILISE — Confirm the hook is real. Then take it somewhere the viewer didn't expect. Not a continuation — a new angle on the same fact.
-4.  SPECIFIC NUMBER — One exact measurement or statistic. Not rounded. This is the credibility anchor.
-5-8. MECHANISM — Explain WHY in short, punchy sentences. Max 10 words each. Somewhere in here, include one sentence that pivots unexpectedly — a fact the viewer couldn't have predicted from the previous sentence. Make them feel like the ground shifted.
-9.  CONSEQUENCE — The real-world result of the mechanism. One sentence. Specific, not vague.
-10. HUMAN COMPARISON — Scale it to something visceral and relatable. Not clever — visceral. The viewer should feel it in their body.
-11. TWIST — The implication nobody mentioned. The thing the viewer will repeat to someone else tonight.
-12. KICKER — A final true statement that reframes the whole thing. NOT a joke. NOT a comparison to pop culture. NOT a meta-comment. A genuine fact or implication that makes the hook land differently the second time.
+STRUCTURE (exactly 12 sentences, minimum 60 seconds):
+1.  HOOK — Scroll-stopper. Shocking or destabilising. NEVER "Did you know". Max 15 words.
+2.  CONFIRM — Make it real. One sentence that proves the hook isn't exaggerating.
+3.  DEEPEN — A second angle on the same fact that makes it stranger. Not a continuation — a new disturbing layer.
+4.  NUMBER — One exact, unrounded measurement or statistic. The credibility anchor.
+5-8. MECHANISM — How and why, in punchy sentences of max 10 words each. Somewhere here: one sentence the viewer could not have predicted. A fact that shifts the ground. Keep the sarcastic undertone — "turns out your body just... does this."
+9.  CONSEQUENCE — What this actually means in the real world. Specific. Not vague.
+10. SCALE — Make the viewer feel it physically. Not a clever comparison — a visceral one.
+11. TWIST — The implication no one mentions. The thing they'll repeat tonight.
+12. KICKER — A single true statement that reframes the hook. Delivered with quiet confidence. NOT a joke. NOT a pop culture reference. NOT a meta-comment. Just the fact, stated like it's obvious — because now it is.
 
 NON-NEGOTIABLE RULES:
-- NEVER open with "Did you know", "Today we're", "It has been", or any passive opener
+- NEVER open with "Did you know", "Today we're", "It has been", or passive openers
 - NEVER end on a question to the viewer
-- NEVER use pop culture, book, or film references in the kicker
-- NEVER write a joke or punchline — the strangeness of the fact IS the payoff
-- Exactly one specific number — not zero, not two
-- The viewer should not be able to predict the next sentence from the previous one
-- Total script: 90-130 words (60-70 seconds at natural pace)
-- Second-person where possible ("your", "you", "imagine")
+- NEVER use a joke, punchline, or "worse branding" style comparison in the kicker
+- Exactly one number — not zero, not two
+- Each sentence should feel like it could stop a scroll on its own
+- 90-130 words total (60-70 seconds at natural pace)
+- Second-person where it fits ("your", "you", "imagine")
 - Halal content only
 
 Return ONLY valid JSON, no markdown, no backticks:
@@ -226,13 +230,13 @@ _MOTION_STYLES = [
     "gentle rightward pan, vivid and dynamic, cinematic",
 ]
 
-_FAL_QUEUE = "https://queue.fal.run"
-_MINIMAX_MODEL = "fal-ai/minimax/video-01-live"
+_FAL_QUEUE   = "https://queue.fal.run"
+_KLING_MODEL = "fal-ai/kling-video/v1.6/standard/image-to-video"
 
 
 def animate_images_ai(image_urls: list[str], slug: str) -> list[Path]:
-    """Submit all images to MiniMax simultaneously via FAL queue. Falls back to Ken Burns on error."""
-    print(f"[4/5] Animating {len(image_urls)} images with MiniMax AI (parallel)...")
+    """Submit all images to Kling simultaneously via FAL queue. Falls back to Ken Burns on error."""
+    print(f"[4/5] Animating {len(image_urls)} images with Kling AI (parallel)...")
     tmp = OUTPUT_DIR / f"{slug}_tmp"
     tmp.mkdir(exist_ok=True)
 
@@ -244,16 +248,16 @@ def animate_images_ai(image_urls: list[str], slug: str) -> list[Path]:
         motion = _MOTION_STYLES[i % len(_MOTION_STYLES)]
         try:
             r = requests.post(
-                f"{_FAL_QUEUE}/{_MINIMAX_MODEL}",
+                f"{_FAL_QUEUE}/{_KLING_MODEL}",
                 headers=headers,
-                json={"image_url": img_url, "prompt": motion},
+                json={"image_url": img_url, "prompt": motion, "duration": "5"},
                 timeout=30,
             )
             r.raise_for_status()
             request_ids.append(r.json()["request_id"])
             print(f"   Queued {i+1}/{len(image_urls)}")
         except Exception as e:
-            raise RuntimeError(f"MiniMax submit failed for clip {i+1}: {e}")
+            raise RuntimeError(f"Kling submit failed for clip {i+1}: {e}")
 
     # Poll all in parallel until every clip is done
     clips: list[Path | None] = [None] * len(request_ids)
@@ -262,18 +266,18 @@ def animate_images_ai(image_urls: list[str], slug: str) -> list[Path]:
 
     while pending:
         if time.time() > deadline:
-            raise RuntimeError("MiniMax animation timed out after 10 minutes")
-        time.sleep(8)
+            raise RuntimeError("Kling animation timed out after 10 minutes")
+        time.sleep(10)
         for i in list(pending):
             try:
                 st = requests.get(
-                    f"{_FAL_QUEUE}/{_MINIMAX_MODEL}/requests/{request_ids[i]}/status",
+                    f"{_FAL_QUEUE}/{_KLING_MODEL}/requests/{request_ids[i]}/status",
                     headers=headers, timeout=15,
                 ).json()
                 status = st.get("status", "")
                 if status == "COMPLETED":
                     result = requests.get(
-                        f"{_FAL_QUEUE}/{_MINIMAX_MODEL}/requests/{request_ids[i]}",
+                        f"{_FAL_QUEUE}/{_KLING_MODEL}/requests/{request_ids[i]}",
                         headers=headers, timeout=15,
                     ).json()
                     video_url = result["video"]["url"]
@@ -283,7 +287,7 @@ def animate_images_ai(image_urls: list[str], slug: str) -> list[Path]:
                     pending.discard(i)
                     print(f"   ✓ Clip {i+1}/{len(request_ids)}")
                 elif status == "FAILED":
-                    raise RuntimeError(f"MiniMax clip {i+1} failed: {st.get('error', '')}")
+                    raise RuntimeError(f"Kling clip {i+1} failed: {st.get('error', '')}")
             except RuntimeError:
                 raise
             except Exception:
