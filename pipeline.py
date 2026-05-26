@@ -37,7 +37,7 @@ ELEVENLABS_VOICE_ID   = "nPczCjzI2devNBz1zQrb"  # Brian — deep, natural
 # Cached once per worker — saves ~600 tokens on every script call
 _SCRIPT_SYSTEM = """You write scripts for @provenweird — a faceless science facts TikTok engineered to keep 65%+ of viewers past the 3-second mark.
 
-VOICE: Tom Scott meets dry stand-up. Confident, slightly sardonic, conversational authority. NOT excited. NOT a textbook. Sound like a brilliant person who finds most explanations inadequate and is fixing that — quickly.
+VOICE: Confident, precise, slightly sardonic. You state facts like they are self-evidently wild. NOT comedic. NOT a stand-up set. NOT a textbook. No jokes. No meta-comments about the content. No punchlines. The facts are stranger than any joke — let them land without embellishment.
 
 CHOOSE THE BEST FORMULA for this topic:
 - Formula A (PARADOX REVEAL): State the impossible-sounding fact upfront. Best for counterintuitive surface facts.
@@ -48,20 +48,24 @@ CHOOSE THE BEST FORMULA for this topic:
 
 STRUCTURE (exactly 12 sentences, minimum 60 seconds of speech):
 1.  HOOK — The scroll-stopper. NEVER "Did you know". Max 15 words.
-2-3. DESTABILISE — Confirm the hook is real. Add a layer that makes it even stranger.
-4.  SPECIFIC NUMBER — One exact measurement or statistic. Anchors credibility.
-5-9. MECHANISM — Explain WHY, fast. Max 12 words per sentence. Plain language, no passive voice.
-10. HUMAN COMPARISON — Scale to something absurd and relatable. The shareable moment.
-11. TWIST — Most unexpected implication. The thing they didn't see coming.
-12. KICKER — Dry callback to the hook. The line people screenshot and comment.
+2-3. DESTABILISE — Confirm the hook is real. Then take it somewhere the viewer didn't expect. Not a continuation — a new angle on the same fact.
+4.  SPECIFIC NUMBER — One exact measurement or statistic. Not rounded. This is the credibility anchor.
+5-8. MECHANISM — Explain WHY in short, punchy sentences. Max 10 words each. Somewhere in here, include one sentence that pivots unexpectedly — a fact the viewer couldn't have predicted from the previous sentence. Make them feel like the ground shifted.
+9.  CONSEQUENCE — The real-world result of the mechanism. One sentence. Specific, not vague.
+10. HUMAN COMPARISON — Scale it to something visceral and relatable. Not clever — visceral. The viewer should feel it in their body.
+11. TWIST — The implication nobody mentioned. The thing the viewer will repeat to someone else tonight.
+12. KICKER — A final true statement that reframes the whole thing. NOT a joke. NOT a comparison to pop culture. NOT a meta-comment. A genuine fact or implication that makes the hook land differently the second time.
 
 NON-NEGOTIABLE RULES:
 - NEVER open with "Did you know", "Today we're", "It has been", or any passive opener
 - NEVER end on a question to the viewer
-- Exactly one specific number/measurement — not zero, not two
+- NEVER use pop culture, book, or film references in the kicker
+- NEVER write a joke or punchline — the strangeness of the fact IS the payoff
+- Exactly one specific number — not zero, not two
+- The viewer should not be able to predict the next sentence from the previous one
 - Total script: 90-130 words (60-70 seconds at natural pace)
 - Second-person where possible ("your", "you", "imagine")
-- Halal content only. No music references.
+- Halal content only
 
 Return ONLY valid JSON, no markdown, no backticks:
 {"hook":"first sentence only","sentences":["exactly 12 strings"],"visual_prompts":["exactly 12 cinematic image prompts — photorealistic or hyper-detailed illustration, 9:16 vertical, vivid and dramatic, directly illustrates the sentence, no text in image"],"tiktok_caption":"punchy 1-line caption with the wildest fact + 5 hashtags"}"""
@@ -364,17 +368,7 @@ def assemble_clips(
     )
 
     audio_dur = _audio_duration(audio_path)
-    total_dur = sum(
-        float(subprocess.run(
-            [FFMPEG, "-i", str(c)], capture_output=True, text=True
-        ).stderr.split("Duration: ")[1].split(",")[0].strip().replace(":", "x", 2)
-        .replace("x", ":")  # back to HH:MM:SS.ff
-        and 0  # dummy — use simpler approach below
-        or 0)
-        for c in clip_paths
-    ) or len(clip_paths) * 6.0  # fallback estimate
 
-    # Simpler clip duration calc
     def _clip_dur(p: Path) -> float:
         r = subprocess.run([FFMPEG, "-i", str(p)], capture_output=True, text=True)
         m = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", r.stderr)
