@@ -21,8 +21,15 @@ ANTHROPIC_API_KEY  = os.environ["ANTHROPIC_API_KEY"]
 ELEVENLABS_API_KEY = os.environ["ELEVENLABS_API_KEY"]
 FAL_KEY            = os.environ["FAL_KEY"]
 
-import imageio_ffmpeg
-FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
+def _get_ffmpeg_exe() -> str:
+    import shutil
+    sys_ffmpeg = shutil.which("ffmpeg")
+    if sys_ffmpeg:
+        return sys_ffmpeg
+    import imageio_ffmpeg
+    return imageio_ffmpeg.get_ffmpeg_exe()
+
+FFMPEG_EXE = _get_ffmpeg_exe()
 
 OUTPUT_DIR = Path(__file__).parent / "output"
 OUTPUT_DIR.mkdir(exist_ok=True)
@@ -256,10 +263,10 @@ def animate_images(image_paths: list[Path], slug: str) -> list[Path]:
         z_expr = _ZOOMPAN_Z[i % len(_ZOOMPAN_Z)]
         clip_path = clip_dir / f"clip_{i:02d}.mp4"
 
-        # Scale to 1440x1920 (same 3:4 AR as FAL output), then zoompan crops to 1080x1920
+        # Scale directly to output resolution — no 1440px intermediate (saves ~30% frame buffer)
         vf = (
-            f"scale=1440:1920:force_original_aspect_ratio=decrease,"
-            f"pad=1440:1920:(ow-iw)/2:(oh-ih)/2:black,"
+            f"scale={VIDEO_W}:{VIDEO_H}:force_original_aspect_ratio=decrease,"
+            f"pad={VIDEO_W}:{VIDEO_H}:(ow-iw)/2:(oh-ih)/2:black,"
             f"zoompan=z='{z_expr}':x='(iw-iw/zoom)/2':y='(ih-ih/zoom)/2'"
             f":d=125:s={VIDEO_W}x{VIDEO_H}:fps=25"
         )
@@ -270,7 +277,9 @@ def animate_images(image_paths: list[Path], slug: str) -> list[Path]:
              "-i", str(img_path),
              "-vf", vf,
              "-frames:v", "125",
-             "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+             "-tune", "zerolatency",
+             "-threads", "1",
              "-pix_fmt", "yuv420p",
              str(clip_path)],
             check=False,
@@ -358,7 +367,8 @@ def assemble_video(
             [FFMPEG_EXE, "-y",
              "-i", str(silent_path),
              "-vf", f"setpts={pts_factor:.4f}*PTS",
-             "-an",
+             "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+             "-threads", "1", "-an",
              str(stretched_path)],
             check=True, capture_output=True,
         )
@@ -434,7 +444,8 @@ def assemble_video(
         [FFMPEG_EXE, "-y",
          "-i", str(stretched_path),
          "-i", str(audio_path),
-         "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26",
+         "-tune", "zerolatency", "-threads", "2",
          "-vf", (
              f"scale={VIDEO_W}:{VIDEO_H}:force_original_aspect_ratio=decrease,"
              f"pad={VIDEO_W}:{VIDEO_H}:(ow-iw)/2:(oh-ih)/2,"
