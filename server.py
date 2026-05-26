@@ -709,6 +709,29 @@ def debug_config():
     })
 
 
+@app.route("/debug/memory")
+def debug_memory():
+    import resource
+    rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    # Linux: ru_maxrss is KB; macOS: it's bytes
+    import platform
+    if platform.system() == "Darwin":
+        rss_mb = rss_kb / 1024 / 1024
+    else:
+        rss_mb = rss_kb / 1024
+    try:
+        with open("/proc/meminfo") as f:
+            meminfo = {line.split(":")[0]: line.split(":")[1].strip() for line in f}
+    except Exception:
+        meminfo = {}
+    return jsonify({
+        "rss_mb": round(rss_mb, 1),
+        "active_jobs": len(jobs),
+        "mem_total": meminfo.get("MemTotal", "N/A"),
+        "mem_available": meminfo.get("MemAvailable", "N/A"),
+    })
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     app.run(host="0.0.0.0", port=port)
