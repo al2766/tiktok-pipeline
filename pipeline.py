@@ -14,7 +14,6 @@ Pipeline:
 import os, json, re, time, subprocess, base64, requests, textwrap, asyncio
 from pathlib import Path
 from dotenv import load_dotenv
-from PIL import Image, ImageDraw, ImageFont
 import fal_client
 
 load_dotenv()
@@ -32,20 +31,6 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 
 VIDEO_W, VIDEO_H = 1080, 1920
 ELEVENLABS_VOICE_ID = "nPczCjzI2devNBz1zQrb"  # Brian — deep, natural, male
-
-
-# ─── Fonts ────────────────────────────────────────────────────────────────────
-
-def get_font(size: int) -> ImageFont.FreeTypeFont:
-    for path in [
-        "/System/Library/Fonts/Helvetica.ttc",
-        "/Library/Fonts/Arial.ttf",
-        "/System/Library/Fonts/Arial.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    ]:
-        if os.path.exists(path):
-            return ImageFont.truetype(path, size)
-    return ImageFont.load_default()
 
 
 # ─── Step 1: Script ───────────────────────────────────────────────────────────

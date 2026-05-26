@@ -4,8 +4,6 @@ python-dotenv
 edge-tts
 imageio[ffmpeg]
 imageio-ffmpeg
-numpy
-pillow
 requests
 yt-dlp
 PyJWT
