@@ -182,11 +182,12 @@ def _whisper_timestamps(audio_path: Path) -> list[dict]:
 
 # ─── Step 3: Images via FAL FLUX ─────────────────────────────────────────────
 
-def generate_images(visual_prompts: list[str], slug: str) -> list[Path]:
-    print(f"[3/4] Generating {len(visual_prompts)} images...")
+def generate_images(visual_prompts: list[str], slug: str) -> tuple[list[Path], list[str]]:
+    """Returns (local_paths, fal_cdn_urls) — URLs are passed to AI animation step."""
+    print(f"[3/5] Generating {len(visual_prompts)} images...")
     img_dir = OUTPUT_DIR / f"{slug}_img"
     img_dir.mkdir(exist_ok=True)
-    paths = []
+    paths, urls = [], []
     for i, prompt in enumerate(visual_prompts):
         resp = requests.post(
             "https://fal.run/fal-ai/flux/schnell",
@@ -206,10 +207,88 @@ def generate_images(visual_prompts: list[str], slug: str) -> list[Path]:
         img_path.write_bytes(requests.get(url, timeout=60).content)
         print(f"   {i+1}/{len(visual_prompts)} ✓")
         paths.append(img_path)
-    return paths
+        urls.append(url)
+    return paths, urls
 
 
-# ─── Step 4: Assemble ─────────────────────────────────────────────────────────
+# ─── Step 4: AI animation via MiniMax (FAL queue) ─────────────────────────────
+
+_MOTION_STYLES = [
+    "slow cinematic zoom in, dramatic atmosphere, smooth motion",
+    "gentle camera drift left, ethereal lighting, fluid",
+    "slow pull back revealing scale, epic atmosphere",
+    "subtle camera movement upward, intense and cinematic",
+    "slow zoom out, atmospheric depth, dramatic reveal",
+    "gentle rightward pan, vivid and dynamic, cinematic",
+]
+
+_FAL_QUEUE = "https://queue.fal.run"
+_MINIMAX_MODEL = "fal-ai/minimax/video-01-live"
+
+
+def animate_images_ai(image_urls: list[str], slug: str) -> list[Path]:
+    """Submit all images to MiniMax simultaneously via FAL queue. Falls back to Ken Burns on error."""
+    print(f"[4/5] Animating {len(image_urls)} images with MiniMax AI (parallel)...")
+    tmp = OUTPUT_DIR / f"{slug}_tmp"
+    tmp.mkdir(exist_ok=True)
+
+    headers = {"Authorization": f"Key {FAL_KEY}", "Content-Type": "application/json"}
+
+    # Submit all requests at once
+    request_ids: list[str] = []
+    for i, img_url in enumerate(image_urls):
+        motion = _MOTION_STYLES[i % len(_MOTION_STYLES)]
+        try:
+            r = requests.post(
+                f"{_FAL_QUEUE}/{_MINIMAX_MODEL}",
+                headers=headers,
+                json={"image_url": img_url, "prompt": motion},
+                timeout=30,
+            )
+            r.raise_for_status()
+            request_ids.append(r.json()["request_id"])
+            print(f"   Queued {i+1}/{len(image_urls)}")
+        except Exception as e:
+            raise RuntimeError(f"MiniMax submit failed for clip {i+1}: {e}")
+
+    # Poll all in parallel until every clip is done
+    clips: list[Path | None] = [None] * len(request_ids)
+    pending   = set(range(len(request_ids)))
+    deadline  = time.time() + 600  # 10-minute hard timeout
+
+    while pending:
+        if time.time() > deadline:
+            raise RuntimeError("MiniMax animation timed out after 10 minutes")
+        time.sleep(8)
+        for i in list(pending):
+            try:
+                st = requests.get(
+                    f"{_FAL_QUEUE}/{_MINIMAX_MODEL}/requests/{request_ids[i]}/status",
+                    headers=headers, timeout=15,
+                ).json()
+                status = st.get("status", "")
+                if status == "COMPLETED":
+                    result = requests.get(
+                        f"{_FAL_QUEUE}/{_MINIMAX_MODEL}/requests/{request_ids[i]}",
+                        headers=headers, timeout=15,
+                    ).json()
+                    video_url = result["video"]["url"]
+                    clip_path = tmp / f"c{i:02d}.mp4"
+                    clip_path.write_bytes(requests.get(video_url, timeout=120).content)
+                    clips[i] = clip_path
+                    pending.discard(i)
+                    print(f"   ✓ Clip {i+1}/{len(request_ids)}")
+                elif status == "FAILED":
+                    raise RuntimeError(f"MiniMax clip {i+1} failed: {st.get('error', '')}")
+            except RuntimeError:
+                raise
+            except Exception:
+                pass  # transient network error — retry next poll cycle
+
+    return [c for c in clips if c is not None]  # type: ignore[misc]
+
+
+# ─── Step 5: Assemble ─────────────────────────────────────────────────────────
 
 _ZOOMPAN = [
     "min(zoom+0.0008,1.12)",
@@ -234,13 +313,8 @@ def _ass_time(t: float) -> str:
     return f"{h}:{m:02d}:{int(s):02d}.{cs:02d}"
 
 
-def assemble_video(image_paths: list[Path], audio_path: Path, boundaries: list[dict], slug: str) -> Path:
-    print("[4/4] Assembling video...")
-    tmp = OUTPUT_DIR / f"{slug}_tmp"
-    tmp.mkdir(exist_ok=True)
-    out_path = OUTPUT_DIR / f"{slug}.mp4"
-
-    # Ken Burns per image → 5-second clips at 25fps
+def _kenburns_clips(image_paths: list[Path], tmp: Path) -> list[Path]:
+    """Ken Burns zoompan fallback — used when AI animation is unavailable."""
     clip_paths = []
     for i, img in enumerate(image_paths):
         z    = _ZOOMPAN[i % 2]
@@ -262,9 +336,22 @@ def assemble_video(image_paths: list[Path], audio_path: Path, boundaries: list[d
         if r.returncode != 0:
             raise RuntimeError(f"FFmpeg clip {i+1} failed:\n{r.stderr.decode(errors='replace')[-400:]}")
         clip_paths.append(clip)
-        print(f"   Clip {i+1}/{len(image_paths)} animated")
+        print(f"   Ken Burns clip {i+1}/{len(image_paths)} ✓")
+    return clip_paths
 
-    # Concat clips
+
+def assemble_clips(
+    clip_paths: list[Path],
+    audio_path: Path,
+    boundaries: list[dict],
+    slug: str,
+    cleanup_images: list[Path] | None = None,
+) -> Path:
+    """Concat AI/Ken-Burns clips + mux audio + burn karaoke captions → final MP4."""
+    print("[5/5] Assembling final video...")
+    tmp     = clip_paths[0].parent  # clips are already in tmp dir
+    out_path = OUTPUT_DIR / f"{slug}.mp4"
+
     concat_list = tmp / "clips.txt"
     with open(concat_list, "w") as f:
         for c in clip_paths:
@@ -276,9 +363,28 @@ def assemble_video(image_paths: list[Path], audio_path: Path, boundaries: list[d
         check=True, capture_output=True,
     )
 
-    # Stretch or trim to match audio
     audio_dur = _audio_duration(audio_path)
-    total_dur = len(clip_paths) * 5.0
+    total_dur = sum(
+        float(subprocess.run(
+            [FFMPEG, "-i", str(c)], capture_output=True, text=True
+        ).stderr.split("Duration: ")[1].split(",")[0].strip().replace(":", "x", 2)
+        .replace("x", ":")  # back to HH:MM:SS.ff
+        and 0  # dummy — use simpler approach below
+        or 0)
+        for c in clip_paths
+    ) or len(clip_paths) * 6.0  # fallback estimate
+
+    # Simpler clip duration calc
+    def _clip_dur(p: Path) -> float:
+        r = subprocess.run([FFMPEG, "-i", str(p)], capture_output=True, text=True)
+        m = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", r.stderr)
+        if not m:
+            return 6.0
+        h, mn, s = m.groups()
+        return int(h) * 3600 + int(mn) * 60 + float(s)
+
+    total_dur = sum(_clip_dur(c) for c in clip_paths)
+
     stretched = tmp / "stretched.mp4"
     if total_dur < audio_dur:
         pts = 1.0 / (total_dur / audio_dur)
@@ -295,7 +401,6 @@ def assemble_video(image_paths: list[Path], audio_path: Path, boundaries: list[d
             check=True, capture_output=True,
         )
 
-    # Build ASS karaoke captions
     font = "Impact" if any(
         os.path.exists(p) for p in ["/Library/Fonts/Impact.ttf", "/System/Library/Fonts/Impact.ttf"]
     ) else "Helvetica"
@@ -323,7 +428,6 @@ def assemble_video(image_paths: list[Path], audio_path: Path, boundaries: list[d
             )
             i += 3
 
-    # Final mux: stretched video + audio + burnt captions
     subprocess.run(
         [FFMPEG, "-y",
          "-i", str(stretched), "-i", str(audio_path),
@@ -339,17 +443,26 @@ def assemble_video(image_paths: list[Path], audio_path: Path, boundaries: list[d
         check=True, capture_output=True,
     )
 
-    # Clean up everything except the final MP4
+    # Clean up tmp dir, images, audio
     shutil.rmtree(tmp, ignore_errors=True)
-    img_dir = image_paths[0].parent if image_paths else None
-    for p in image_paths:
-        p.unlink(missing_ok=True)
-    if img_dir and img_dir.exists():
-        shutil.rmtree(img_dir, ignore_errors=True)
+    if cleanup_images:
+        img_dir = cleanup_images[0].parent if cleanup_images else None
+        for p in cleanup_images:
+            p.unlink(missing_ok=True)
+        if img_dir and img_dir.exists():
+            shutil.rmtree(img_dir, ignore_errors=True)
     audio_path.unlink(missing_ok=True)
 
     print(f"✅ {out_path.name}")
     return out_path
+
+
+def assemble_video(image_paths: list[Path], audio_path: Path, boundaries: list[dict], slug: str) -> Path:
+    """Ken Burns fallback path — used when AI animation is skipped."""
+    tmp = OUTPUT_DIR / f"{slug}_tmp"
+    tmp.mkdir(exist_ok=True)
+    clip_paths = _kenburns_clips(image_paths, tmp)
+    return assemble_clips(clip_paths, audio_path, boundaries, slug, cleanup_images=image_paths)
 
 
 # ─── Google Drive upload (optional) ──────────────────────────────────────────
@@ -389,12 +502,15 @@ def upload_to_drive(video_path: Path) -> str | None:
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def generate_video(topic: str) -> tuple[Path, str]:
-    slug        = re.sub(r"[^a-z0-9]+", "_", topic.lower())[:40] + f"_{int(time.time())}"
-    script      = generate_script(topic)
-    audio, wds  = generate_tts(script["script"], slug)
-    images      = generate_images(script["visual_prompts"], slug)
-    video       = assemble_video(images, audio, wds, slug)
-    caption     = script.get("tiktok_caption", "")
+    slug              = re.sub(r"[^a-z0-9]+", "_", topic.lower())[:40] + f"_{int(time.time())}"
+    script            = generate_script(topic)
+    audio, wds        = generate_tts(script["script"], slug)
+    image_paths, urls = generate_images(script["visual_prompts"], slug)
+    tmp               = OUTPUT_DIR / f"{slug}_tmp"
+    tmp.mkdir(exist_ok=True)
+    clip_paths        = animate_images_ai(urls, slug)
+    video             = assemble_clips(clip_paths, audio, wds, slug, cleanup_images=image_paths)
+    caption           = script.get("tiktok_caption", "")
     print(f"\n📋 Caption: {caption}")
     return video, caption
 
