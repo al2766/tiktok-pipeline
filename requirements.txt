@@ -7,5 +7,4 @@ imageio-ffmpeg
 requests
 yt-dlp
 PyJWT
-fal-client
 playwright

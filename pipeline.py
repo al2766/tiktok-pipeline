@@ -14,14 +14,12 @@ Pipeline:
 import os, json, re, time, subprocess, base64, requests, textwrap, asyncio
 from pathlib import Path
 from dotenv import load_dotenv
-import fal_client
 
 load_dotenv()
 
 ANTHROPIC_API_KEY  = os.environ["ANTHROPIC_API_KEY"]
 ELEVENLABS_API_KEY = os.environ["ELEVENLABS_API_KEY"]
 FAL_KEY            = os.environ["FAL_KEY"]
-os.environ["FAL_KEY"] = FAL_KEY
 
 import imageio_ffmpeg
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -200,6 +198,27 @@ def generate_tts(script: str, slug: str) -> tuple[Path, list[dict]]:
 
 # ─── Step 3: FAL AI images (one per sentence) ─────────────────────────────────
 
+def _fal_generate_image_url(prompt: str) -> str:
+    """Call FAL FLUX/schnell sync endpoint directly — no fal_client library."""
+    resp = requests.post(
+        "https://fal.run/fal-ai/flux/schnell",
+        headers={
+            "Authorization": f"Key {FAL_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "prompt": prompt + ", 9:16 vertical aspect ratio, ultra high quality",
+            "image_size": "portrait_4_3",
+            "num_inference_steps": 4,
+            "num_images": 1,
+            "enable_safety_checker": False,
+        },
+        timeout=90,
+    )
+    resp.raise_for_status()
+    return resp.json()["images"][0]["url"]
+
+
 def generate_images(visual_prompts: list[str], slug: str) -> list[Path]:
     """Generate images via FAL FLUX and save locally. Returns list of local paths."""
     print(f"[3/5] Generating {len(visual_prompts)} images via FAL FLUX...")
@@ -209,20 +228,9 @@ def generate_images(visual_prompts: list[str], slug: str) -> list[Path]:
 
     for i, prompt in enumerate(visual_prompts):
         print(f"   Image {i+1}/{len(visual_prompts)}...")
-        result = fal_client.run(
-            "fal-ai/flux/schnell",
-            arguments={
-                "prompt": prompt + ", 9:16 vertical aspect ratio, ultra high quality",
-                "image_size": "portrait_4_3",
-                "num_inference_steps": 4,
-                "num_images": 1,
-                "enable_safety_checker": False,
-            },
-        )
-        url = result["images"][0]["url"]
+        url = _fal_generate_image_url(prompt)
         img_path = img_dir / f"img_{i:02d}.jpg"
-        img_data = requests.get(url, timeout=60).content
-        img_path.write_bytes(img_data)
+        img_path.write_bytes(requests.get(url, timeout=60).content)
         image_paths.append(img_path)
         print(f"   ✓ saved {img_path.name}")
 
