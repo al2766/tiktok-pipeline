@@ -5,6 +5,5 @@ edge-tts
 imageio[ffmpeg]
 imageio-ffmpeg
 requests
-yt-dlp
-PyJWT
 playwright
+faster-whisper

@@ -1,17 +1,14 @@
 """
-@provenweird TikTok Video Pipeline — v2
+@provenweird TikTok Video Pipeline
 Input:  topic string
-Output: MP4 file in ./output/
-
-Pipeline:
-  1. Claude  → 10-sentence script + per-sentence visual prompts
-  2. ElevenLabs → natural voice audio + word-level timestamps
-  3. FAL AI (FLUX) → 1 HD 9:16 image per sentence
-  4. Kling AI → animate each image into a 5s video clip
-  5. FFmpeg  → concat clips + mux audio + burn animated captions
+Output: single MP4 in ./output/ — no intermediates kept
+Steps:  1. Claude (cached system prompt) → 12-sentence script + visual prompts
+        2. ElevenLabs → voice MP3 + word timestamps
+        3. FAL FLUX → 12 × 9:16 images
+        4. FFmpeg → Ken Burns per image → concat → stretch → captions → mux audio
 """
 
-import os, json, re, time, subprocess, base64, requests, textwrap, asyncio
+import os, json, re, time, subprocess, base64, requests, asyncio, shutil
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -21,149 +18,129 @@ ANTHROPIC_API_KEY  = os.environ["ANTHROPIC_API_KEY"]
 ELEVENLABS_API_KEY = os.environ["ELEVENLABS_API_KEY"]
 FAL_KEY            = os.environ["FAL_KEY"]
 
-def _get_ffmpeg_exe() -> str:
-    import shutil
-    sys_ffmpeg = shutil.which("ffmpeg")
-    if sys_ffmpeg:
-        return sys_ffmpeg
+def _ffmpeg() -> str:
+    import shutil as _shutil
+    exe = _shutil.which("ffmpeg")
+    if exe:
+        return exe
     import imageio_ffmpeg
     return imageio_ffmpeg.get_ffmpeg_exe()
 
-FFMPEG_EXE = _get_ffmpeg_exe()
-
+FFMPEG     = _ffmpeg()
 OUTPUT_DIR = Path(__file__).parent / "output"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-VIDEO_W, VIDEO_H = 1080, 1920
-ELEVENLABS_VOICE_ID = "nPczCjzI2devNBz1zQrb"  # Brian — deep, natural, male
+VIDEO_W, VIDEO_H      = 1080, 1920
+ELEVENLABS_VOICE_ID   = "nPczCjzI2devNBz1zQrb"  # Brian — deep, natural
+
+# Cached once per worker — saves ~600 tokens on every script call
+_SCRIPT_SYSTEM = """You write scripts for @provenweird — a faceless science facts TikTok engineered to keep 65%+ of viewers past the 3-second mark.
+
+VOICE: Tom Scott meets dry stand-up. Confident, slightly sardonic, conversational authority. NOT excited. NOT a textbook. Sound like a brilliant person who finds most explanations inadequate and is fixing that — quickly.
+
+CHOOSE THE BEST FORMULA for this topic:
+- Formula A (PARADOX REVEAL): State the impossible-sounding fact upfront. Best for counterintuitive surface facts.
+- Formula B (CURIOSITY GAP): Open the loop, don't answer it. Best when the MECHANISM is more interesting than the fact.
+- Formula C (MYTH-BUST): "You've been told X. That's wrong." Best when a popular belief is false.
+- Formula D (STAKES-FIRST): Open with the consequence affecting the viewer directly. Best for biology/psychology.
+- Formula E (EXISTENTIAL PIVOT): Lead with the philosophical QUESTION the fact raises — not the fact itself. Best when the fact implies something about identity, consciousness, or time.
+
+STRUCTURE (exactly 12 sentences, minimum 60 seconds of speech):
+1.  HOOK — The scroll-stopper. NEVER "Did you know". Max 15 words.
+2-3. DESTABILISE — Confirm the hook is real. Add a layer that makes it even stranger.
+4.  SPECIFIC NUMBER — One exact measurement or statistic. Anchors credibility.
+5-9. MECHANISM — Explain WHY, fast. Max 12 words per sentence. Plain language, no passive voice.
+10. HUMAN COMPARISON — Scale to something absurd and relatable. The shareable moment.
+11. TWIST — Most unexpected implication. The thing they didn't see coming.
+12. KICKER — Dry callback to the hook. The line people screenshot and comment.
+
+NON-NEGOTIABLE RULES:
+- NEVER open with "Did you know", "Today we're", "It has been", or any passive opener
+- NEVER end on a question to the viewer
+- Exactly one specific number/measurement — not zero, not two
+- Total script: 90-130 words (60-70 seconds at natural pace)
+- Second-person where possible ("your", "you", "imagine")
+- Halal content only. No music references.
+
+Return ONLY valid JSON, no markdown, no backticks:
+{"hook":"first sentence only","sentences":["exactly 12 strings"],"visual_prompts":["exactly 12 cinematic image prompts — photorealistic or hyper-detailed illustration, 9:16 vertical, vivid and dramatic, directly illustrates the sentence, no text in image"],"tiktok_caption":"punchy 1-line caption with the wildest fact + 5 hashtags"}"""
 
 
 # ─── Step 1: Script ───────────────────────────────────────────────────────────
 
 def generate_script(topic: str) -> dict:
-    print(f"[1/5] Generating script: {topic}")
-    system = """You write scripts for @provenweird — a faceless science facts TikTok. Your scripts are engineered to keep 65%+ of viewers past the 3-second mark. The algorithm punishes weak hooks and rewards completion.
-
-VOICE: Tom Scott meets dry stand-up. Confident, slightly sardonic, conversational authority. NOT excited. NOT a textbook. Sound like a brilliant person who finds most explanations inadequate and is going to fix that — quickly.
-
-CHOOSE THE BEST FORMULA for this topic and apply it:
-- Formula A (PARADOX REVEAL): State the impossible-sounding fact upfront. Best for counterintuitive surface facts.
-- Formula B (CURIOSITY GAP): Open the loop, don't answer it. Best when the MECHANISM is more interesting than the fact.
-- Formula C (MYTH-BUST): "You've been told X. That's wrong." Best when a popular belief is false.
-- Formula D (STAKES-FIRST): Open with the consequence affecting the viewer directly. Best for biology/psychology.
-- Formula E (EXISTENTIAL PIVOT): Lead with the philosophical QUESTION the fact raises — not the fact itself. The science is the evidence, not the hook. Best when the fact implies something about identity, consciousness, existence, or time. Example: instead of "your body replaces its cells every 7 years" → "If your body replaces most of its cells over time, are you still the same person?" The question opens a loop inside the viewer's own head. They save it because the question is the point.
-
-STRUCTURE (exactly 12 sentences — minimum 60 seconds for TikTok Creator Rewards):
-1.  HOOK — The scroll-stopper. State the paradox, gap, myth, or stakes. NEVER "Did you know". Max 15 words.
-2-3. DESTABILISE — Confirm the hook is real. Add a layer that makes it even stranger.
-4.  SPECIFIC NUMBER — One exact measurement or statistic. This anchors credibility. (e.g. "exactly 37 degrees", "900 million tonnes", "3 times per second")
-5-9. MECHANISM — Explain WHY, fast. Max 12 words per sentence. Plain language, no passive voice. Each sentence lands alone.
-10. HUMAN COMPARISON — Scale it to something absurd and relatable. This is the shareable moment.
-11. TWIST — The most unexpected implication. The thing they didn't see coming.
-12. KICKER — Dry callback to the hook. Reframes everything. This is the line people screenshot and comment.
-
-NON-NEGOTIABLE RULES:
-- NEVER open with "Did you know", "Today we're", "It has been", or any passive opener
-- NEVER end on a question to the viewer ("What do you think?")
-- Exactly one specific number/measurement — not zero, not two
-- Total script: 90-130 words (60-70 seconds of speech at natural pace)
-- Second-person where possible ("your", "you", "imagine")
-- Halal content only. No music references.
-
-Return ONLY valid JSON (no markdown, no backticks):
-{
-  "hook": "first sentence only — the scroll-stopper",
-  "sentences": ["exactly 12 strings"],
-  "visual_prompts": ["exactly 12 cinematic image prompts — one per sentence, photorealistic or hyper-detailed illustration, 9:16 vertical, vivid and dramatic, directly illustrates the sentence, no text in image"],
-  "tiktok_caption": "punchy 1-line caption with the wildest fact + 5 hashtags — no exclamation spam"
-}"""
-
+    print(f"[1/4] Generating script: {topic}")
     for attempt in range(3):
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={
                 "x-api-key": ANTHROPIC_API_KEY,
                 "anthropic-version": "2023-06-01",
+                "anthropic-beta": "prompt-caching-2024-07-31",
                 "content-type": "application/json",
             },
             json={
                 "model": "claude-sonnet-4-6",
-                "max_tokens": 2000,
-                "system": system,
+                "max_tokens": 1800,
+                "system": [{"type": "text", "text": _SCRIPT_SYSTEM, "cache_control": {"type": "ephemeral"}}],
                 "messages": [{"role": "user", "content": f"Topic: {topic}"}],
             },
             timeout=30,
         )
         resp.raise_for_status()
         raw = resp.json()["content"][0]["text"].strip()
+        # Strip markdown fences if Claude adds them
         if raw.startswith("```"):
             raw = raw.split("```")[1]
             if raw.startswith("json"):
                 raw = raw[4:]
         try:
             data = json.loads(raw.strip())
-            # Build full script string from sentences
             data["script"] = " ".join(data["sentences"])
             print(f"   Hook: {data['hook']}")
             return data
         except json.JSONDecodeError:
-            time.sleep(2)
-    raise RuntimeError("Script generation failed")
+            if attempt < 2:
+                time.sleep(2)
+    raise RuntimeError("Script generation failed after 3 attempts")
 
 
-# ─── Step 2: TTS with word timestamps ────────────────────────────────────────
+# ─── Step 2: TTS + word timestamps ───────────────────────────────────────────
 
-def _whisper_word_boundaries(audio_path: Path) -> list[dict]:
-    """Run faster-whisper on audio to extract word-level timestamps."""
-    from faster_whisper import WhisperModel
-    model_dir = Path(__file__).parent / "whisper_models"
-    model_dir.mkdir(exist_ok=True)
-    print("   Running Whisper for word timestamps...")
-    model = WhisperModel("small", device="cpu", compute_type="int8",
-                         download_root=str(model_dir))
-    segments_raw, _ = model.transcribe(str(audio_path), word_timestamps=True, vad_filter=True)
-    boundaries = []
-    for seg in segments_raw:
-        if seg.words:
-            for w in seg.words:
-                boundaries.append({
-                    "word":  w.word.strip(),
-                    "start": round(w.start, 3),
-                    "end":   round(w.end, 3),
-                })
-    del model
-    return boundaries
+def generate_tts(script: str, slug: str) -> tuple[Path, list[dict]]:
+    print("[2/4] Generating voice...")
+    audio_path = OUTPUT_DIR / f"{slug}_audio.mp3"
 
-
-def _elevenlabs_tts(script: str, audio_path: Path) -> list[dict] | None:
-    """Try ElevenLabs TTS. Returns word boundaries on success, None on 401."""
     resp = requests.post(
         f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}/with-timestamps",
         headers={"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"},
         json={
             "text": script,
             "model_id": "eleven_multilingual_v2",
-            "voice_settings": {
-                "stability": 0.5,
-                "similarity_boost": 0.85,
-                "style": 0.2,
-                "use_speaker_boost": True,
-            },
+            "voice_settings": {"stability": 0.5, "similarity_boost": 0.85, "style": 0.2, "use_speaker_boost": True},
         },
         timeout=60,
     )
-    if resp.status_code == 401:
-        return None
-    resp.raise_for_status()
-    data = resp.json()
-    audio_path.write_bytes(base64.b64decode(data["audio_base64"]))
 
-    boundaries, alignment = [], data.get("alignment", {})
+    if resp.status_code == 401:
+        print("   ElevenLabs blocked — falling back to edge-tts + Whisper")
+        _edge_tts(script, audio_path)
+        boundaries = _whisper_timestamps(audio_path)
+    else:
+        resp.raise_for_status()
+        data = resp.json()
+        audio_path.write_bytes(base64.b64decode(data["audio_base64"]))
+        boundaries = _parse_elevenlabs_alignment(data.get("alignment", {}))
+
+    print(f"   {len(boundaries)} word boundaries")
+    return audio_path, boundaries
+
+
+def _parse_elevenlabs_alignment(alignment: dict) -> list[dict]:
     chars  = alignment.get("characters", [])
     starts = alignment.get("character_start_times_seconds", [])
     ends   = alignment.get("character_end_times_seconds", [])
-
-    word, w_start, w_end = "", None, None
+    boundaries, word, w_start, w_end = [], "", None, None
     for ch, s, e in zip(chars, starts, ends):
         if ch in (" ", "\n"):
             if word:
@@ -179,7 +156,7 @@ def _elevenlabs_tts(script: str, audio_path: Path) -> list[dict] | None:
     return boundaries
 
 
-def _edge_tts_generate(script: str, audio_path: Path):
+def _edge_tts(script: str, audio_path: Path):
     import edge_tts
     async def _run():
         comm = edge_tts.Communicate(script, voice="en-US-ChristopherNeural")
@@ -187,301 +164,207 @@ def _edge_tts_generate(script: str, audio_path: Path):
     asyncio.run(_run())
 
 
-def generate_tts(script: str, slug: str) -> tuple[Path, list[dict]]:
-    audio_path = OUTPUT_DIR / f"{slug}_audio.mp3"
+def _whisper_timestamps(audio_path: Path) -> list[dict]:
+    from faster_whisper import WhisperModel
+    model_dir = Path(__file__).parent / "whisper_models"
+    model_dir.mkdir(exist_ok=True)
+    model = WhisperModel("small", device="cpu", compute_type="int8", download_root=str(model_dir))
+    segments_raw, _ = model.transcribe(str(audio_path), word_timestamps=True, vad_filter=True)
+    boundaries = []
+    for seg in segments_raw:
+        if seg.words:
+            for w in seg.words:
+                boundaries.append({"word": w.word.strip(), "start": round(w.start, 3), "end": round(w.end, 3)})
+    del model
+    return boundaries
 
-    print("[2/5] Generating voice with ElevenLabs...")
-    boundaries = _elevenlabs_tts(script, audio_path)
 
-    if boundaries is None:
-        # ElevenLabs blocked (free tier / VPN detection) — fall back to edge-tts
-        print("   ElevenLabs unavailable — falling back to edge-tts + Whisper timestamps")
-        _edge_tts_generate(script, audio_path)
-        boundaries = _whisper_word_boundaries(audio_path)
-
-    print(f"   {len(boundaries)} word boundaries, audio saved.")
-    return audio_path, boundaries
-
-
-# ─── Step 3: FAL AI images (one per sentence) ─────────────────────────────────
-
-def _fal_generate_image_url(prompt: str) -> str:
-    """Call FAL FLUX/schnell sync endpoint directly — no fal_client library."""
-    resp = requests.post(
-        "https://fal.run/fal-ai/flux/schnell",
-        headers={
-            "Authorization": f"Key {FAL_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "prompt": prompt + ", 9:16 vertical aspect ratio, ultra high quality",
-            "image_size": "portrait_4_3",
-            "num_inference_steps": 4,
-            "num_images": 1,
-            "enable_safety_checker": False,
-        },
-        timeout=90,
-    )
-    resp.raise_for_status()
-    return resp.json()["images"][0]["url"]
-
+# ─── Step 3: Images via FAL FLUX ─────────────────────────────────────────────
 
 def generate_images(visual_prompts: list[str], slug: str) -> list[Path]:
-    """Generate images via FAL FLUX and save locally. Returns list of local paths."""
-    print(f"[3/5] Generating {len(visual_prompts)} images via FAL FLUX...")
-    img_dir = OUTPUT_DIR / f"{slug}_images"
+    print(f"[3/4] Generating {len(visual_prompts)} images...")
+    img_dir = OUTPUT_DIR / f"{slug}_img"
     img_dir.mkdir(exist_ok=True)
-    image_paths = []
-
+    paths = []
     for i, prompt in enumerate(visual_prompts):
-        print(f"   Image {i+1}/{len(visual_prompts)}...")
-        url = _fal_generate_image_url(prompt)
-        img_path = img_dir / f"img_{i:02d}.jpg"
+        resp = requests.post(
+            "https://fal.run/fal-ai/flux/schnell",
+            headers={"Authorization": f"Key {FAL_KEY}", "Content-Type": "application/json"},
+            json={
+                "prompt": prompt + ", 9:16 vertical aspect ratio, ultra high quality, cinematic",
+                "image_size": "portrait_4_3",
+                "num_inference_steps": 4,
+                "num_images": 1,
+                "enable_safety_checker": False,
+            },
+            timeout=90,
+        )
+        resp.raise_for_status()
+        url = resp.json()["images"][0]["url"]
+        img_path = img_dir / f"{i:02d}.jpg"
         img_path.write_bytes(requests.get(url, timeout=60).content)
-        image_paths.append(img_path)
-        print(f"   ✓ saved {img_path.name}")
+        print(f"   {i+1}/{len(visual_prompts)} ✓")
+        paths.append(img_path)
+    return paths
 
-    return image_paths
 
+# ─── Step 4: Assemble ─────────────────────────────────────────────────────────
 
-# ─── Step 4: FFmpeg zoompan animation ─────────────────────────────────────────
-
-# Alternating zoom-in / zoom-out Ken Burns effect — no API calls, no downloads
-_ZOOMPAN_Z = [
-    "min(zoom+0.0008,1.12)",                                   # zoom in
-    "if(lte(zoom,1.0),1.10,max(1.0,zoom-0.0008))",            # zoom out
+_ZOOMPAN = [
+    "min(zoom+0.0008,1.12)",
+    "if(lte(zoom,1.0),1.10,max(1.0,zoom-0.0008))",
 ]
 
 
-def animate_images(image_paths: list[Path], slug: str) -> list[Path]:
-    print(f"[4/5] Animating {len(image_paths)} images with FFmpeg zoompan...")
-    clip_dir = OUTPUT_DIR / f"{slug}_clips"
-    clip_dir.mkdir(exist_ok=True)
-
-    video_paths = []
-    for i, img_path in enumerate(image_paths):
-        z_expr = _ZOOMPAN_Z[i % len(_ZOOMPAN_Z)]
-        clip_path = clip_dir / f"clip_{i:02d}.mp4"
-
-        # Scale directly to output resolution — no 1440px intermediate (saves ~30% frame buffer)
-        vf = (
-            f"scale={VIDEO_W}:{VIDEO_H}:force_original_aspect_ratio=decrease,"
-            f"pad={VIDEO_W}:{VIDEO_H}:(ow-iw)/2:(oh-ih)/2:black,"
-            f"zoompan=z='{z_expr}':x='(iw-iw/zoom)/2':y='(ih-ih/zoom)/2'"
-            f":d=125:s={VIDEO_W}x{VIDEO_H}:fps=25"
-        )
-
-        result = subprocess.run(
-            [FFMPEG_EXE, "-y",
-             "-loop", "1",
-             "-i", str(img_path),
-             "-vf", vf,
-             "-frames:v", "125",
-             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
-             "-tune", "zerolatency",
-             "-threads", "1",
-             "-pix_fmt", "yuv420p",
-             str(clip_path)],
-            check=False,
-            capture_output=True,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"FFmpeg zoompan failed for clip {i+1}: "
-                + result.stderr.decode(errors="replace")[-400:]
-            )
-        print(f"   ✓ Clip {i+1}/{len(image_paths)} animated")
-        video_paths.append(clip_path)
-
-    return video_paths
+def _audio_duration(audio_path: Path) -> float:
+    r = subprocess.run([FFMPEG, "-i", str(audio_path)], capture_output=True, text=True)
+    m = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", r.stderr)
+    if not m:
+        raise RuntimeError("Could not read audio duration")
+    h, mn, s = m.groups()
+    return int(h) * 3600 + int(mn) * 60 + float(s)
 
 
-# ─── Step 5: FFmpeg assembly ──────────────────────────────────────────────────
-
-def _get_audio_duration(audio_path: Path) -> float:
-    result = subprocess.run(
-        [FFMPEG_EXE, "-i", str(audio_path)],
-        capture_output=True, text=True,
-    )
-    match = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", result.stderr)
-    if not match:
-        raise RuntimeError("Could not determine audio duration")
-    h, m, s = match.groups()
-    return int(h) * 3600 + int(m) * 60 + float(s)
+def _ass_time(t: float) -> str:
+    h  = int(t // 3600)
+    m  = int((t % 3600) // 60)
+    s  = t % 60
+    cs = int((s % 1) * 100)
+    return f"{h}:{m:02d}:{int(s):02d}.{cs:02d}"
 
 
-def _build_caption_chunks(boundaries: list[dict], chunk_size: int = 4) -> list[dict]:
-    chunks = []
-    for i in range(0, len(boundaries), chunk_size):
-        group = boundaries[i: i + chunk_size]
-        chunks.append({
-            "text":  " ".join(w["word"] for w in group),
-            "start": group[0]["start"],
-            "end":   group[-1]["end"],
-        })
-    return chunks
-
-
-def assemble_video(
-    clip_paths: list[Path],
-    audio_path: Path,
-    word_boundaries: list[dict],
-    script_data: dict,
-    slug: str,
-) -> Path:
-    print("[5/5] Assembling final video...")
-
-    audio_duration = _get_audio_duration(audio_path)
+def assemble_video(image_paths: list[Path], audio_path: Path, boundaries: list[dict], slug: str) -> Path:
+    print("[4/4] Assembling video...")
+    tmp = OUTPUT_DIR / f"{slug}_tmp"
+    tmp.mkdir(exist_ok=True)
     out_path = OUTPUT_DIR / f"{slug}.mp4"
 
-    # Build FFmpeg concat + stretch to match audio
-    # Each clip is 5s; total clip duration = 5 * n_clips
-    n_clips = len(clip_paths)
-    clip_duration = 5.0
-    total_clip_duration = n_clips * clip_duration
+    # Ken Burns per image → 5-second clips at 25fps
+    clip_paths = []
+    for i, img in enumerate(image_paths):
+        z    = _ZOOMPAN[i % 2]
+        clip = tmp / f"c{i:02d}.mp4"
+        vf   = (
+            f"scale={VIDEO_W}:{VIDEO_H}:force_original_aspect_ratio=decrease,"
+            f"pad={VIDEO_W}:{VIDEO_H}:(ow-iw)/2:(oh-ih)/2:black,"
+            f"zoompan=z='{z}':x='(iw-iw/zoom)/2':y='(ih-ih/zoom)/2'"
+            f":d=125:s={VIDEO_W}x{VIDEO_H}:fps=25"
+        )
+        r = subprocess.run(
+            [FFMPEG, "-y", "-loop", "1", "-i", str(img),
+             "-vf", vf, "-frames:v", "125",
+             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+             "-tune", "zerolatency", "-threads", "1", "-pix_fmt", "yuv420p",
+             str(clip)],
+            capture_output=True,
+        )
+        if r.returncode != 0:
+            raise RuntimeError(f"FFmpeg clip {i+1} failed:\n{r.stderr.decode(errors='replace')[-400:]}")
+        clip_paths.append(clip)
+        print(f"   Clip {i+1}/{len(image_paths)} animated")
 
-    # Write concat list
-    concat_file = OUTPUT_DIR / f"{slug}_concat.txt"
-    with open(concat_file, "w") as f:
-        for cp in clip_paths:
-            f.write(f"file '{cp.resolve()}'\n")
+    # Concat clips
+    concat_list = tmp / "clips.txt"
+    with open(concat_list, "w") as f:
+        for c in clip_paths:
+            f.write(f"file '{c.resolve()}'\n")
 
-    # Step A: Concat all clips into a silent video
-    silent_path = OUTPUT_DIR / f"{slug}_silent.mp4"
+    silent = tmp / "silent.mp4"
     subprocess.run(
-        [FFMPEG_EXE, "-y",
-         "-f", "concat", "-safe", "0",
-         "-i", str(concat_file),
-         "-c", "copy",
-         str(silent_path)],
+        [FFMPEG, "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list), "-c", "copy", str(silent)],
         check=True, capture_output=True,
     )
 
-    # Step B: Stretch/loop silent video to match audio duration
-    stretched_path = OUTPUT_DIR / f"{slug}_stretched.mp4"
-    if total_clip_duration < audio_duration:
-        # Need to stretch — slow down video proportionally
-        speed_factor = total_clip_duration / audio_duration  # < 1 = slow down
-        pts_factor = 1.0 / speed_factor
+    # Stretch or trim to match audio
+    audio_dur = _audio_duration(audio_path)
+    total_dur = len(clip_paths) * 5.0
+    stretched = tmp / "stretched.mp4"
+    if total_dur < audio_dur:
+        pts = 1.0 / (total_dur / audio_dur)
         subprocess.run(
-            [FFMPEG_EXE, "-y",
-             "-i", str(silent_path),
-             "-vf", f"setpts={pts_factor:.4f}*PTS",
-             "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-             "-threads", "1", "-an",
-             str(stretched_path)],
+            [FFMPEG, "-y", "-i", str(silent),
+             "-vf", f"setpts={pts:.4f}*PTS",
+             "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-threads", "1", "-an",
+             str(stretched)],
             check=True, capture_output=True,
         )
     else:
-        # Trim to audio duration
         subprocess.run(
-            [FFMPEG_EXE, "-y",
-             "-i", str(silent_path),
-             "-t", str(audio_duration),
-             "-c", "copy",
-             str(stretched_path)],
+            [FFMPEG, "-y", "-i", str(silent), "-t", str(audio_dur), "-c", "copy", str(stretched)],
             check=True, capture_output=True,
         )
 
-    # Step C: Build word-by-word karaoke captions (ASS format)
-    def _ass_time(t: float) -> str:
-        h = int(t // 3600)
-        m = int((t % 3600) // 60)
-        s = t % 60
-        cs = int((s % 1) * 100)
-        return f"{h}:{m:02d}:{int(s):02d}.{cs:02d}"
-
-    # Find a good font — prefer Impact (TikTok style), fall back to Helvetica
-    caption_font = "Impact"
-    for fp in ["/Library/Fonts/Impact.ttf", "/System/Library/Fonts/Impact.ttf"]:
-        if os.path.exists(fp):
-            caption_font = "Impact"
-            break
-    else:
-        caption_font = "Helvetica"
-
-    ass_path = OUTPUT_DIR / f"{slug}.ass"
-    with open(ass_path, "w", encoding="utf-8") as f:
-        f.write("[Script Info]\n")
-        f.write(f"PlayResX: {VIDEO_W}\nPlayResY: {VIDEO_H}\nScriptType: v4.00+\n\n")
+    # Build ASS karaoke captions
+    font = "Impact" if any(
+        os.path.exists(p) for p in ["/Library/Fonts/Impact.ttf", "/System/Library/Fonts/Impact.ttf"]
+    ) else "Helvetica"
+    ass = tmp / "captions.ass"
+    with open(ass, "w", encoding="utf-8") as f:
+        f.write(f"[Script Info]\nPlayResX: {VIDEO_W}\nPlayResY: {VIDEO_H}\nScriptType: v4.00+\n\n")
         f.write("[V4+ Styles]\n")
         f.write("Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
                 "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
                 "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
                 "Alignment, MarginL, MarginR, MarginV, Encoding\n")
-        # White bold text, thick black outline, bottom-center at MarginV=160
-        f.write(f"Style: Default,{caption_font},72,&H00FFFFFF,&H00FFFFFF,"
-                f"&H00000000,&H00000000,1,0,0,0,100,100,2,0,1,4,0,2,30,30,160,1\n")
-        # Highlighted word style — yellow
-        f.write(f"Style: Highlight,{caption_font},72,&H0000FFFF,&H0000FFFF,"
+        f.write(f"Style: Default,{font},72,&H00FFFFFF,&H00FFFFFF,"
                 f"&H00000000,&H00000000,1,0,0,0,100,100,2,0,1,4,0,2,30,30,160,1\n\n")
-        f.write("[Events]\n")
-        f.write("Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n")
+        f.write("[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n")
+        i = 0
+        while i < len(boundaries):
+            grp   = boundaries[i:i+3]
+            parts = [
+                f"{{\\k{max(1, int((w['end'] - w['start']) * 100))}}}{w['word'].upper()}"
+                for w in grp
+            ]
+            f.write(
+                f"Dialogue: 0,{_ass_time(grp[0]['start'])},{_ass_time(grp[-1]['end'])},"
+                f"Default,,0,0,0,,{' '.join(parts)}\n"
+            )
+            i += 3
 
-        # Group words into lines of 3 words max (karaoke per line)
-        if word_boundaries:
-            i = 0
-            while i < len(word_boundaries):
-                group = word_boundaries[i: i + 3]
-                line_start = group[0]["start"]
-                line_end   = group[-1]["end"]
-
-                # Build karaoke line: each word tagged with its duration in centiseconds
-                parts = []
-                for w in group:
-                    dur_cs = max(1, int((w["end"] - w["start"]) * 100))
-                    parts.append(f"{{\\k{dur_cs}}}{w['word'].upper()}")
-
-                line_text = " ".join(parts)
-                f.write(f"Dialogue: 0,{_ass_time(line_start)},{_ass_time(line_end)},"
-                        f"Default,,0,0,0,,{line_text}\n")
-                i += 3
-
-    # Step D: Mux audio + burn ASS subtitles
-    srt_path = ass_path  # reuse variable for the filter path
-
+    # Final mux: stretched video + audio + burnt captions
     subprocess.run(
-        [FFMPEG_EXE, "-y",
-         "-i", str(stretched_path),
-         "-i", str(audio_path),
+        [FFMPEG, "-y",
+         "-i", str(stretched), "-i", str(audio_path),
          "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26",
          "-tune", "zerolatency", "-threads", "2",
          "-vf", (
              f"scale={VIDEO_W}:{VIDEO_H}:force_original_aspect_ratio=decrease,"
              f"pad={VIDEO_W}:{VIDEO_H}:(ow-iw)/2:(oh-ih)/2,"
-             f"ass={ass_path}"
+             f"ass={ass}"
          ),
-         "-c:a", "aac", "-b:a", "192k",
-         "-shortest",
+         "-c:a", "aac", "-b:a", "192k", "-shortest",
          str(out_path)],
         check=True, capture_output=True,
     )
 
-    # Cleanup temp files
-    silent_path.unlink(missing_ok=True)
-    stretched_path.unlink(missing_ok=True)
-    concat_file.unlink(missing_ok=True)
+    # Clean up everything except the final MP4
+    shutil.rmtree(tmp, ignore_errors=True)
+    img_dir = image_paths[0].parent if image_paths else None
+    for p in image_paths:
+        p.unlink(missing_ok=True)
+    if img_dir and img_dir.exists():
+        shutil.rmtree(img_dir, ignore_errors=True)
+    audio_path.unlink(missing_ok=True)
 
-    print(f"\n✅ Video ready: {out_path}")
+    print(f"✅ {out_path.name}")
     return out_path
 
 
-# ─── Main entry points ────────────────────────────────────────────────────────
+# ─── Main ─────────────────────────────────────────────────────────────────────
 
-def generate_video(topic: str) -> Path:
-    slug = re.sub(r"[^a-z0-9]+", "_", topic.lower())[:40] + f"_{int(time.time())}"
-
-    script_data          = generate_script(topic)
-    audio_path, words    = generate_tts(script_data["script"], slug)
-    image_urls           = generate_images(script_data["visual_prompts"], slug)
-    clip_paths           = animate_images(image_urls, slug)
-    video_path           = assemble_video(clip_paths, audio_path, words, script_data, slug)
-
-    print(f"\n📋 Caption:\n{script_data['tiktok_caption']}")
-    return video_path
+def generate_video(topic: str) -> tuple[Path, str]:
+    slug        = re.sub(r"[^a-z0-9]+", "_", topic.lower())[:40] + f"_{int(time.time())}"
+    script      = generate_script(topic)
+    audio, wds  = generate_tts(script["script"], slug)
+    images      = generate_images(script["visual_prompts"], slug)
+    video       = assemble_video(images, audio, wds, slug)
+    caption     = script.get("tiktok_caption", "")
+    print(f"\n📋 Caption: {caption}")
+    return video, caption
 
 
 if __name__ == "__main__":
     import sys
-    topic = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else "octopuses have three hearts and blue blood"
+    topic = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else "honey never expires — found in 3000-year-old Egyptian tombs"
     generate_video(topic)
