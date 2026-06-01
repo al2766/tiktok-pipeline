@@ -163,28 +163,36 @@ def generate_script(topic: str) -> dict:
 def _fl2v_submit(first_path: Path, last_path: Path, prompt: str) -> str:
     first_b64 = base64.b64encode(first_path.read_bytes()).decode()
     last_b64  = base64.b64encode(last_path.read_bytes()).decode()
-    resp = requests.post(
-        f"{MINIMAX_BASE}/video_generation",
-        headers={"Authorization": f"Bearer {MINIMAX_API_KEY}", "Content-Type": "application/json"},
-        json={
-            "model":             FL2V_MODEL,
-            "first_frame_image": f"data:image/jpeg;base64,{first_b64}",
-            "last_frame_image":  f"data:image/jpeg;base64,{last_b64}",
-            "prompt":            prompt,
-            "prompt_optimizer":  True,
-            "duration":          FL2V_DURATION,
-        },
-        timeout=60,
-    )
-    resp.raise_for_status()
-    data        = resp.json()
-    status_code = data.get("base_resp", {}).get("status_code", -1)
-    if status_code != 0:
+    # Retry up to 5 times on RPM rate limit (status 1002)
+    for attempt, wait in enumerate([0, 15, 30, 60, 120]):
+        if wait:
+            print(f"   Rate limit hit — waiting {wait}s before retry {attempt}…")
+            time.sleep(wait)
+        resp = requests.post(
+            f"{MINIMAX_BASE}/video_generation",
+            headers={"Authorization": f"Bearer {MINIMAX_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model":             FL2V_MODEL,
+                "first_frame_image": f"data:image/jpeg;base64,{first_b64}",
+                "last_frame_image":  f"data:image/jpeg;base64,{last_b64}",
+                "prompt":            prompt,
+                "prompt_optimizer":  True,
+                "duration":          FL2V_DURATION,
+            },
+            timeout=60,
+        )
+        resp.raise_for_status()
+        data        = resp.json()
+        status_code = data.get("base_resp", {}).get("status_code", -1)
+        if status_code == 0:
+            return str(data["task_id"])
+        if status_code == 1002:
+            continue   # rate limit — retry after wait
         raise RuntimeError(
             f"MiniMax fl2v submit failed (status {status_code}): "
             f"{data.get('base_resp', {}).get('status_msg')}"
         )
-    return str(data["task_id"])
+    raise RuntimeError("MiniMax fl2v rate limit persisted after 5 retries")
 
 
 def _fl2v_poll(task_id: str, timeout: int = 500) -> str:
@@ -240,7 +248,7 @@ def animate_images(image_paths: list[Path], slug: str) -> list[Path]:
         print(f"   Submitting clip {i + 1}/{n_clips} (frame {i + 1}→{i + 2})...")
         task_id = _fl2v_submit(image_paths[i], image_paths[i + 1], prompt)
         task_ids.append(task_id)
-        time.sleep(0.5)
+        time.sleep(5)   # 5s gap between submissions to respect RPM limit
 
     # Poll and download in submission order
     clip_paths: list[Path] = []
