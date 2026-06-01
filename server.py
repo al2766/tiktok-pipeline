@@ -24,7 +24,7 @@ load_dotenv()
 import imageio_ffmpeg
 os.environ["FFMPEG_BINARY"] = imageio_ffmpeg.get_ffmpeg_exe()
 
-from pipeline import generate_script, generate_tts, generate_images, animate_images, assemble_clips, upload_to_drive
+from pipeline_v6 import generate_script, generate_tts, generate_images, animate_images, assemble_clips, upload_to_drive
 
 app  = Flask(__name__)
 CORS(app)
@@ -512,6 +512,117 @@ No markdown. No explanation."""
         "source":           "playwright+reddit" if (insta_videos or moments_lines) else "claude_fallback",
         "books_researched": books,
     })
+
+
+# ─── Topic queue (Reddit scrape + Claude scoring) ────────────────────────────
+
+_SCORE_PROMPT = """You pick topics for @provenweird — a TikTok channel making 25-second fact videos.
+
+The winning formula: an everyday object or animal the viewer has definitely seen before, explained in 25 seconds, with one surprising truth they never knew. The hook is always "most people think X, but actually Y."
+
+Best examples of topics that work:
+- Why escalator brushes are designed to annoy you (not clean shoes)
+- Why the hole in a soda tab exists (not for a straw)
+- Why pandas are forced to watch TV at the zoo
+- Why belugas are considered the kindest animal on earth
+- Why cats only meow at humans and never at other cats
+
+From the Reddit posts below, pick the 5 best topics. For each return:
+- clean_topic: 6-12 word topic phrase for a script generator (NOT the Reddit title — reframe it as a "why/what/how" question or surprising statement)
+- familiarity: 0-10 (has every viewer definitely seen this thing in real life?)
+- visual: 0-10 (can the whole video show ONE consistent scene — same animal, object, or place?)
+- length: 0-10 (fully explainable in 25 seconds?)
+- total: sum of the three scores
+
+Skip anything: NSFW, about specific living people, political, requiring more than 30 seconds, or too obscure for a general audience.
+
+Return ONLY a valid JSON array of exactly 5 objects. No markdown, no explanation.
+
+Reddit posts:
+{posts}"""
+
+
+@app.route("/topics/refresh")
+def topics_refresh():
+    subreddits = [
+        ("todayilearned",    500, 30),
+        ("interestingasfuck", 300, 20),
+        ("mildlyinteresting", 200, 15),
+    ]
+
+    candidates = []
+
+    def _fetch(sub, min_score, limit):
+        try:
+            r = http_requests.get(
+                f"https://www.reddit.com/r/{sub}/top.json",
+                params={"t": "day", "limit": limit},
+                headers={"User-Agent": _REDDIT_UA},
+                timeout=8,
+            )
+            for post in r.json()["data"]["children"]:
+                d = post["data"]
+                if (d["score"] >= min_score
+                        and not d.get("over_18")
+                        and len(d["title"]) > 20):
+                    candidates.append({
+                        "subreddit": f"r/{sub}",
+                        "title":     d["title"][:220],
+                        "upvotes":   d["score"],
+                        "url":       f"https://reddit.com{d['permalink']}",
+                    })
+        except Exception as e:
+            print(f"Reddit fetch {sub} failed: {e}")
+
+    threads = [
+        threading.Thread(target=_fetch, args=(sub, ms, lim), daemon=True)
+        for sub, ms, lim in subreddits
+    ]
+    for t in threads: t.start()
+    for t in threads: t.join(timeout=12)
+
+    if not candidates:
+        return jsonify({"error": "No Reddit posts fetched"}), 500
+
+    # Deduplicate and take top 30 by upvotes
+    seen = set()
+    unique = []
+    for c in sorted(candidates, key=lambda x: x["upvotes"], reverse=True):
+        key = c["title"][:60].lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(c)
+        if len(unique) >= 30:
+            break
+
+    posts_block = "\n".join(
+        f"{i+1}. [{c['subreddit']}] {c['title']}"
+        for i, c in enumerate(unique)
+    )
+
+    raw = _call_claude(
+        _SCORE_PROMPT.format(posts=posts_block),
+        max_tokens=800,
+    )
+
+    try:
+        scored = json.loads(raw)
+        # Attach original metadata
+        title_map = {c["title"][:60].lower(): c for c in unique}
+        for item in scored:
+            # Try to find the matching original post for the URL
+            item["url"] = ""
+            item["upvotes"] = 0
+            for orig in unique:
+                if any(word in orig["title"].lower()
+                       for word in item.get("clean_topic", "").lower().split()[:3]):
+                    item["url"]     = orig["url"]
+                    item["upvotes"] = orig["upvotes"]
+                    item["subreddit"] = orig["subreddit"]
+                    break
+        return jsonify({"topics": scored})
+    except Exception as e:
+        return jsonify({"error": f"Scoring failed: {e}", "raw": raw}), 500
 
 
 # ─── Health / debug ───────────────────────────────────────────────────────────
