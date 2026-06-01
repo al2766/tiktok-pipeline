@@ -544,45 +544,75 @@ Reddit posts:
 
 @app.route("/topics/refresh")
 def topics_refresh():
+    # t=week gives more posts so thresholds can be lower — still feels fresh
     subreddits = [
-        ("todayilearned",    500, 30),
-        ("interestingasfuck", 300, 20),
-        ("mildlyinteresting", 200, 15),
+        ("todayilearned",     100, 30),
+        ("interestingasfuck",  50, 20),
+        ("mildlyinteresting",  30, 15),
+        ("Damnthatsinteresting", 50, 15),
     ]
 
     candidates = []
+    _UA = "Mozilla/5.0 (compatible; provenweird/1.0; +https://github.com/al2766/tiktok-pipeline)"
 
     def _fetch(sub, min_score, limit):
-        try:
-            r = http_requests.get(
-                f"https://www.reddit.com/r/{sub}/top.json",
-                params={"t": "day", "limit": limit},
-                headers={"User-Agent": _REDDIT_UA},
-                timeout=8,
-            )
-            for post in r.json()["data"]["children"]:
-                d = post["data"]
-                if (d["score"] >= min_score
-                        and not d.get("over_18")
-                        and len(d["title"]) > 20):
-                    candidates.append({
-                        "subreddit": f"r/{sub}",
-                        "title":     d["title"][:220],
-                        "upvotes":   d["score"],
-                        "url":       f"https://reddit.com{d['permalink']}",
-                    })
-        except Exception as e:
-            print(f"Reddit fetch {sub} failed: {e}")
+        for timeframe in ("day", "week"):
+            try:
+                r = http_requests.get(
+                    f"https://www.reddit.com/r/{sub}/top.json",
+                    params={"t": timeframe, "limit": limit},
+                    headers={
+                        "User-Agent": _UA,
+                        "Accept": "application/json",
+                    },
+                    timeout=15,
+                )
+                if r.status_code != 200:
+                    print(f"Reddit {sub} {timeframe}: HTTP {r.status_code}")
+                    continue
+                posts = r.json().get("data", {}).get("children", [])
+                found = 0
+                for post in posts:
+                    d = post["data"]
+                    if (d["score"] >= min_score
+                            and not d.get("over_18")
+                            and len(d["title"]) > 20):
+                        candidates.append({
+                            "subreddit": f"r/{sub}",
+                            "title":     d["title"][:220],
+                            "upvotes":   d["score"],
+                            "url":       f"https://reddit.com{d['permalink']}",
+                        })
+                        found += 1
+                print(f"Reddit {sub} {timeframe}: {found} posts")
+                if found > 0:
+                    break   # got results from this timeframe, skip week
+            except Exception as e:
+                print(f"Reddit fetch {sub} {timeframe} failed: {e}")
 
     threads = [
         threading.Thread(target=_fetch, args=(sub, ms, lim), daemon=True)
         for sub, ms, lim in subreddits
     ]
     for t in threads: t.start()
-    for t in threads: t.join(timeout=12)
+    for t in threads: t.join(timeout=20)
 
+    # Fallback: if Reddit is blocked, use Claude to generate fresh topics directly
     if not candidates:
-        return jsonify({"error": "No Reddit posts fetched"}), 500
+        print("Reddit blocked — falling back to Claude topic generation")
+        raw = _call_claude(
+            """Generate 10 great topics for @provenweird — a TikTok channel making 25-second fact videos.
+The formula: everyday object or animal the viewer definitely knows, with one surprising truth they never knew.
+Examples: escalator brushes, soda tab hole, pandas watching TV, cats only meowing at humans.
+Return ONLY a JSON array of 10 title strings. No markdown.""",
+            max_tokens=400,
+        )
+        try:
+            fallback_titles = json.loads(raw)
+            for title in fallback_titles:
+                candidates.append({"subreddit": "AI generated", "title": title, "upvotes": 0, "url": ""})
+        except Exception:
+            return jsonify({"error": "Both Reddit and fallback failed"}), 500
 
     # Deduplicate and take top 30 by upvotes
     seen = set()
