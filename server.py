@@ -24,7 +24,7 @@ load_dotenv()
 import imageio_ffmpeg
 os.environ["FFMPEG_BINARY"] = imageio_ffmpeg.get_ffmpeg_exe()
 
-from pipeline_v6 import generate_script, generate_tts, generate_images, animate_images, assemble_clips, upload_to_drive
+from pipeline_v5 import generate_script, generate_tts, generate_images, animate_images, assemble_clips, upload_to_drive
 
 app  = Flask(__name__)
 CORS(app)
